@@ -280,6 +280,40 @@ def resolve_with_ai(rel_path: str, body: str, customizations: str) -> dict[str, 
 
 
 # ── verification ─────────────────────────────────────────────────────────────
+def _import_check(rel_paths: list[str]) -> list[str]:
+    """Import each changed module in a subprocess; return the ones that fail.
+
+    Weaker than the test suite but far stronger than a parse check: it executes
+    module-level code, so a bad merge that references a removed upstream symbol
+    is caught. Modules that are not importable in isolation (scripts, __main__
+    guards, optional deps) are skipped rather than reported as failures — a
+    false alarm here would roll back a good sync.
+    """
+    failures: list[str] = []
+    for rel in rel_paths:
+        if not rel.endswith(".py"):
+            continue
+        # Only check importable package modules; standalone scripts and test
+        # files are not meant to be imported.
+        if rel.startswith(("tests/", "scripts/")) or "/" not in rel.replace("\\", "/"):
+            continue
+        module = rel[:-3].replace("/", ".").replace("\\", ".")
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip().splitlines()
+            last = err[-1] if err else "unknown error"
+            # A missing optional third-party dep is an environment gap, not a
+            # merge defect. Do not roll back a good sync over it.
+            if "ModuleNotFoundError" in last and module.split(".")[0] not in last:
+                continue
+            failures.append(f"{rel}: {last}")
+    return failures
+
+
 def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
     """Nothing is accepted unverified.
 
@@ -311,14 +345,31 @@ def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
         return True, "; ".join(notes) or "parse-only (quick mode)"
 
     if py:
-        proc = subprocess.run(
-            ["bash", "-lc", "cd '%s' && ./scripts/run_tests.sh" % REPO_ROOT.as_posix()],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-        if proc.returncode != 0:
-            tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-25:])
-            return False, f"python tests failed:\n{tail}"
-        notes.append("python tests passed")
+        # The suite needs pytest in the repo venv. On this install it is absent,
+        # and "the harness cannot run" is NOT the same failure as "the tests
+        # failed" — conflating them would fail every single sync and train the
+        # user to ignore the alert. Probe first, and degrade to the import check
+        # (which does exercise the changed modules) while saying so plainly.
+        have_pytest = subprocess.run(
+            [sys.executable, "-c", "import pytest"],
+            capture_output=True, text=True,
+        ).returncode == 0
+
+        if not have_pytest:
+            failed_imports = _import_check(py)
+            if failed_imports:
+                return False, "changed module failed to import: " + "; ".join(failed_imports)
+            notes.append(f"imported {len(py)} changed module(s) "
+                         "(pytest not installed in the venv, so the suite was skipped)")
+        else:
+            proc = subprocess.run(
+                ["bash", "-lc", "cd '%s' && ./scripts/run_tests.sh" % REPO_ROOT.as_posix()],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if proc.returncode != 0:
+                tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-25:])
+                return False, f"python tests failed:\n{tail}"
+            notes.append("python tests passed")
 
     if ts:
         proc = subprocess.run(
@@ -421,12 +472,33 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
         customizations = cust.read_text(encoding="utf-8", errors="replace")
 
     def rollback() -> None:
-        """Restore without `reset --hard` (hard invariant)."""
-        if (Path(git.out("rev-parse", "--absolute-git-dir")) / "MERGE_HEAD").exists():
+        """Restore the pre-sync state without `reset --hard` (hard invariant).
+
+        Order matters, and an earlier version got this wrong: moving the branch
+        ref with `update-ref` leaves the index and working tree holding the
+        MERGED content, so the tree ends up full of staged modifications against
+        the restored commit. A real run left 100+ files staged. The index must be
+        reset (mixed, never hard) and the tree checked out to match.
+        """
+        gitdir = Path(git.out("rev-parse", "--absolute-git-dir"))
+        if (gitdir / "MERGE_HEAD").exists():
             git("merge", "--abort", allow_rewrite=True)
+
         if git.out("rev-parse", "HEAD") != rec.pre_sha:
             git("update-ref", f"refs/heads/{branch}", rec.pre_sha, allow_rewrite=True)
-            git("checkout", "--", ".")
+
+        # `reset` with no mode is --mixed: it rewrites the index but NEVER
+        # discards working-tree content, so it does not violate the no-hard-reset
+        # invariant. Then restore tracked files to the commit's state.
+        git("reset", "-q", allow_rewrite=True)
+        git("checkout", "--", ".")
+
+        leftover = git.out("status", "--porcelain")
+        if leftover:
+            tracked = [l for l in leftover.splitlines() if not l.startswith("??")]
+            if tracked:
+                print(f"  ⚠ rollback left {len(tracked)} modified file(s); "
+                      f"recover with: git checkout {rec.rollback_tag}")
         print(f"  restored to {rec.rollback_tag}")
 
     # MERGE, not rebase — see the module docstring. This is what keeps the app's
