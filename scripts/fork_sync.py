@@ -442,10 +442,17 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
         if not git.ok("fetch", "--unshallow", "upstream"):
             return finish("failed", "could not unshallow the repository", 1)
 
-    dirty = git.out("status", "--porcelain")
+    # Only TRACKED modifications block a sync. Untracked files do not prevent a
+    # merge, and refusing to run because of one is a self-inflicted deadlock: a
+    # single stray file (e.g. a new test file left behind by a previous upstream
+    # merge) would silently disable syncing forever. Verified: this exact case
+    # blocked a real run.
+    dirty = [l for l in git.out("status", "--porcelain").splitlines()
+             if l and not l.startswith("??")]
     if dirty:
         return finish("deferred",
-                      "working tree not clean; skipping sync (nothing was changed)", 0)
+                      f"{len(dirty)} uncommitted change(s) in the repo; skipping sync "
+                      "(nothing was changed)", 0)
 
     print(f"→ fetching upstream/{branch}")
     if not git.ok("fetch", "upstream", branch):
