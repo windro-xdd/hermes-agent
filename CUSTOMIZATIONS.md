@@ -187,32 +187,87 @@ this file useful to a resolver model and to future work — do not skip them.
 - **Deliberately not done:** not placed in `docs/` — upstream churns that
   directory, and the resolver needs a predictable path.
 
-#### `updater-hermes-sync` — route the native Update button through `hermes-sync`
-- **Status:** planned — Phase 1 Task 4
-- **Files:** `scripts/hermes-sync.ps1` (new, the engine) + `hermes_cli/main.py`
-  (mount only, smallest possible hunk)
-- **What:** clicking Update rebases this fork's patches onto new upstream instead
-  of the stock pull/reset, so customizations survive.
+#### `fork-sync` — keep the fork current with upstream, losing nothing
+- **Status:** active
+- **Files:** `scripts/fork_sync.py` (the engine), `scripts/fork-guard.sh` (the
+  backstop hook), `~/.hermes/scripts/fork_sync_tick.py` (cron launcher, lives in
+  user data). **Zero upstream files modified.**
+- **What:** a scheduled job merges new upstream commits into the fork, resolves
+  any conflict with `claude-opus-5`, verifies, and pushes. Hermes's own update
+  popup then fires normally and clicking Update is a plain fast-forward of
+  already-verified code.
 - **Why:** the stock path runs `git reset --hard origin/<branch>` on divergence,
-  which destroys every fork commit.
-- **Mount:** `hermes_cli/main.py` — the git update step inside the update command
-  (the `reset --hard origin/<branch>` site). Replace that step with a call out to
-  `hermes-sync`; do not touch detection.
-- **Depends on:** `upstream` remote existing; the update command still performing
-  its git step in one identifiable place; `PROJECT_ROOT`.
-- **If the seam moves:** **hand-resolve, never AI-resolve** (R14). Re-locate the
-  git update step by searching for `reset`, `--hard`, and `pull --ff-only` in
-  `hermes_cli/main.py`; re-apply the same substitution. Do not trust line numbers
-  from any doc — upstream moves them constantly (this patch's seam already moved
-  ~350 lines in one 233-commit catch-up).
-- **Degrades to:** if `hermes-sync` is missing or fails, the update **aborts and
-  notifies**. It must never fall through to `reset --hard`.
-- **Next / related:** detection at `main.py` (the `compare_branch` /
-  `upstream/<branch>` logic) is deliberately left alone so the native popup keeps
-  working — do not "simplify" the two together.
-- **Deliberately not done:** not patching the Electron self-update path in
-  `apps/desktop/electron/main.ts` as well; the CLI git step is the single
-  chokepoint and one seam is cheaper to maintain than two.
+  destroying every fork commit. Three sites do this, not one:
+  `hermes_cli/main.py:11540`, `scripts/install.ps1:1524`, `scripts/install.sh:1226`.
+  install.ps1's own comment says it exists to discard "local-only commits".
+
+- **MERGE, NOT REBASE — the load-bearing decision.** The original plan said
+  rebase. Sandbox testing showed rebase *creates* the hazard:
+
+  | strategy | old local sha still an ancestor of the fork tip? | app's `pull --ff-only` |
+  |---|---|---|
+  | rebase | **NO** (SHAs rewritten) | **fails → triggers `reset --hard`** |
+  | merge  | **YES** | succeeds; reset unreachable |
+
+  Failing `pull --ff-only` is the *only* route to the reset at `main.py:11540`.
+  Rebasing every sync would have manufactured that condition on purpose.
+  Verified on the live repo: every `pre-sync-*` tag remains an ancestor of HEAD.
+
+- **Mount:** none. This is why merge matters — it makes patching the update path
+  unnecessary. Measured churn: `hermes_cli/main.py` 455 commits/90d,
+  `apps/desktop/src/app/settings/` 206. Patching either would be a permanent
+  conflict tax on the highest-churn files in the tree.
+- **Depends on:** an `upstream` remote; a non-shallow clone (the engine unshallows
+  if needed — the installer clones `--depth 1` and merge needs a merge-base); the
+  kiro proxy for conflict resolution *only* (a clean merge never calls a model).
+- **If the seam moves:** there is no seam to move. If upstream ever changes the
+  update flow so a merged fork still cannot fast-forward, re-check the table
+  above before reaching for a patch.
+- **Degrades to:** any failure → rollback tag restored, nothing pushed, app keeps
+  running the previous build. A failed sync **defers**; it never bricks.
+- **Next / related:** a Settings page showing sync history and AI resolutions is
+  deliberately deferred (see below). Sync history is already recorded as JSONL at
+  `~/.hermes/fork-sync/history.jsonl`, so a UI can be added later without
+  changing the engine.
+- **Deliberately not done:**
+  - **No patch to `hermes_cli/main.py`.** Unnecessary under merge, and it is the
+    single highest-churn file in the repo.
+  - **No Settings page (yet).** It would mean editing the second-highest-churn
+    directory (206 commits/90d) permanently, for a read-only log viewer. A chat
+    notification plus the JSONL history delivers the same information at zero
+    merge risk. Revisit only if the notification proves insufficient.
+  - **No PowerShell.** `scripts/hermes-sync.ps1` was written and removed:
+    upstream ships 20 `.py` scripts to 2 `.ps1`, PS 5.1 mis-parses BOM-less
+    non-ASCII (three failed fix attempts chasing phantom line numbers), and the
+    caller is Python.
+  - **No force-push.** A merge never rewrites history, so a plain push always
+    works and nothing can be lost to a rewrite.
+
+#### `fork-guard` — refuse a ref update that would abandon fork commits
+- **Status:** active (backstop only)
+- **Files:** `scripts/fork-guard.sh`, installed to `.git/hooks/reference-transaction`
+- **What:** blocks any branch move onto a *remote* tip that would drop unpushed
+  fork commits — which is exactly what all three `reset --hard` sites do.
+- **Why:** `scripts/install.ps1` and `scripts/install.sh` run entirely outside the
+  Python update path, so nothing in `fork_sync.py` can protect against them. This
+  covers whichever site fires, including any not yet found.
+- **Mount:** none — a git hook, unversioned. Upstream cannot conflict with it.
+- **Depends on:** git ≥ 2.9 (`reference-transaction`). Confirmed on 2.54.0.
+- **If the seam moves:** git removing this hook would break it; there is no
+  `pre-reset` hook to fall back on (verified: *"cannot find a hook named
+  pre-reset"*). The patched-site approach would then be the only option.
+- **Degrades to:** `.git/hooks` is not versioned, so a reinstall silently drops
+  the guard. `fork_sync.py` reinstalls it on **every** run — the protection is
+  self-healing. `HERMES_SYNC_ALLOW_REWRITE=1` overrides it for deliberate surgery.
+- **Known limitation (verified, do not "fix" without reading this):** git's hook
+  interface presents `reset --hard` and `reset --soft` as an *identical* ref move,
+  so the guard also refuses a `--soft` that lands on a remote tip while unpushed
+  fork work exists. Two earlier designs were rejected by testing: v1 blocked
+  `git rebase` and stranded the repo mid-sequencer; v2 fixed that but blocked
+  every `reset --soft`. 15/15 sandbox tests now pass in both directions.
+- **Deliberately not done:** not attempting to detect the reset *mode* — the
+  information does not reach the hook. An attempt to infer it from working-tree
+  state wrongly un-blocked the real attack.
 
 ### Existing customizations that live in user data
 Registered for **resolver context only** — these are not fork commits and cannot
