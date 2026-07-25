@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""Keep windro's fork current with upstream, without ever losing a customization.
+
+WHY THIS EXISTS
+    The stock update path destroys fork commits. On divergence it runs
+    ``git reset --hard origin/<branch>`` — verified at three separate sites:
+    hermes_cli/main.py:11540, scripts/install.ps1:1524, scripts/install.sh:1226.
+    install.ps1's own comment says it is there to discard "local-only commits".
+
+THE KEY DESIGN DECISION: MERGE, NOT REBASE
+    The project plan specified rebase. Testing showed rebase is the WRONG choice
+    here, and the reason is subtle enough to write down.
+
+    Rebase rewrites the fork's commit SHAs every sync. The desktop app's local
+    checkout still sits at an OLD sha, which is then no longer an ancestor of the
+    fork tip — so ``git pull --ff-only`` FAILS, and failing ff-only is the exact
+    and only trigger for ``reset --hard`` at main.py:11540. Rebasing would
+    manufacture the very condition that destroys the fork.
+
+    Merge keeps every existing commit reachable, so the old sha stays an ancestor
+    and the app's pull is always a clean fast-forward. Verified empirically:
+
+        rebase: old fork sha ancestor of new tip -> NO  (ff-only fails)
+        merge:  old fork sha ancestor of new tip -> YES (ff-only succeeds)
+
+    Consequences of choosing merge:
+      * The destructive reset becomes UNREACHABLE in normal operation, so the
+        highest-churn file in the tree (hermes_cli/main.py — 455 commits/90d)
+        does NOT need patching. Zero upstream files modified.
+      * No force-push. Nothing is ever rewritten, so nothing can be lost to a
+        rewrite. Recovery is always "check out the tag".
+      * History shows merge commits instead of a linear replay. Cosmetic.
+
+HOW IT RUNS
+    Unattended, on a schedule. Fetch upstream, tag a rollback point, merge, and
+    if the merge is clean and verification passes, push the fork. The desktop
+    app's normal update check then sees new commits on origin and shows its
+    native popup; clicking Update is a plain fast-forward of already-verified
+    code.
+
+CONFLICT POLICY
+    A conflict is resolved by claude-opus-5 via the local kiro proxy, then
+    verified by build/tests before being accepted. Low confidence, a failed
+    verification, or a conflict in the update mechanism itself -> abort, restore
+    the rollback point, and notify. A failed sync DEFERS; it never ships a
+    broken tree and never leaves the app unrunnable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+PROXY_URL = "http://127.0.0.1:8081/v1/messages"
+RESOLVER_MODEL = "claude-opus-5"
+RESOLVER_MAX_TOKENS = 32000
+PROXY_TIMEOUT_S = 600
+
+# Conflicts in these files are NEVER sent to the model. They ARE the update
+# mechanism; a wrong resolution here can destroy the ability to update at all.
+# Enforced in code rather than asked of the model — instructing a model "do not
+# resolve this" while handing it exactly that file is self-defeating.
+HAND_RESOLVE_ONLY = (
+    "hermes_cli/main.py",
+    "scripts/install.ps1",
+    "scripts/install.sh",
+    "scripts/fork_sync.py",
+    "scripts/fork-guard.sh",
+)
+
+CONFLICT_MARKER_RE = re.compile(r"^(<{7}|={7}|>{7})", re.MULTILINE)
+
+
+def _state_dir() -> Path:
+    """Where sync history and reports live (outside the repo, so never committed)."""
+    base = os.environ.get("HERMES_HOME") or os.path.join(
+        os.environ.get("LOCALAPPDATA", str(Path.home())), "hermes"
+    )
+    return Path(base) / "fork-sync"
+
+
+HISTORY_PATH = _state_dir() / "history.jsonl"
+REPORT_DIR = _state_dir() / "reports"
+
+
+# ── git plumbing ─────────────────────────────────────────────────────────────
+@dataclass
+class Git:
+    """Thin git runner. Never raises on non-zero exit; callers decide."""
+
+    cwd: Path
+
+    def __call__(self, *args: str, allow_rewrite: bool = False) -> subprocess.CompletedProcess:
+        # windows.appendAtomically=false mirrors what the stock updater uses to
+        # work around a Windows git ref-write bug.
+        cmd = ["git", "-c", "windows.appendAtomically=false", *args]
+        env = dict(os.environ)
+        if allow_rewrite:
+            # Tell the fork-guard hook this is our own deliberate operation.
+            env["HERMES_SYNC_ALLOW_REWRITE"] = "1"
+        return subprocess.run(
+            cmd,
+            cwd=str(self.cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+
+    def out(self, *args: str) -> str:
+        return self(*args).stdout.strip()
+
+    def ok(self, *args: str) -> bool:
+        return self(*args).returncode == 0
+
+
+# ── result recording ─────────────────────────────────────────────────────────
+@dataclass
+class Resolution:
+    """One AI-resolved conflict, recorded so it can be reviewed later."""
+
+    path: str
+    confidence: str
+    reasoning: str
+    accepted: bool
+    merged_preview: str = ""
+
+
+@dataclass
+class SyncRecord:
+    """One sync attempt. Appended to history.jsonl for the UI and for auditing."""
+
+    started_at: str
+    status: str = "running"          # ok | up-to-date | failed | deferred
+    upstream_commits: int = 0
+    fork_patches: int = 0
+    rollback_tag: str = ""
+    pre_sha: str = ""
+    post_sha: str = ""
+    message: str = ""
+    conflicts: list[str] = field(default_factory=list)
+    resolutions: list[dict] = field(default_factory=list)
+    verification: str = ""
+    pushed: bool = False
+    duration_s: float = 0.0
+    report_path: str = ""
+
+    def save(self) -> None:
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(asdict(self), ensure_ascii=False) + "\n")
+
+
+def _write_report(name: str, body: str) -> str:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = REPORT_DIR / f"{name}-{stamp}.txt"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+# ── the resolver ─────────────────────────────────────────────────────────────
+RESOLVER_SYSTEM_PROMPT = """\
+You resolve a git MERGE conflict while bringing windro's personal customizations
+onto a NEW upstream release of Hermes (Electron + Python AI agent).
+Inputs: CUSTOMIZATIONS.md (what each patch does + why) and one conflicted file.
+In this merge, "ours" (<<<<<<<) = OUR fork's code; "theirs" (>>>>>>>) = NEW UPSTREAM.
+Goal: produce a merged file that keeps BOTH upstream's new behavior AND our
+customization's intent.
+Rules:
+- Never weaken/delete an upstream change to make ours apply — adapt ours into the
+  new upstream structure.
+- Never drop our customization — re-express it against the new code.
+- Prefer minimal, additive edits; match upstream's current style and APIs.
+- If upstream removed the seam our patch used, adapt to the new seam; if truly
+  impossible, leave a clearly-marked TODO(custom-hermes) and lower confidence.
+Output ONLY the full resolved file contents (no conflict markers, no commentary).
+Then a final line: CONFIDENCE: high|medium|low — <one sentence why>.
+"""
+
+
+def resolve_with_ai(rel_path: str, body: str, customizations: str) -> dict[str, Any]:
+    """Ask the resolver for a merged file.
+
+    Returns {ok, content, confidence, reasoning} or {ok: False, reason}.
+    """
+    user = (
+        "=== CUSTOMIZATIONS.md ===\n"
+        f"{customizations}\n\n"
+        f"=== CONFLICTED FILE: {rel_path} ===\n"
+        f"{body}"
+    )
+    payload = json.dumps(
+        {
+            "model": RESOLVER_MODEL,
+            "max_tokens": RESOLVER_MAX_TOKENS,
+            "system": RESOLVER_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user}],
+        }
+    ).encode("utf-8")
+
+    req = urllib.request.Request(
+        PROXY_URL,
+        data=payload,
+        headers={
+            "content-type": "application/json",
+            "x-api-key": "no-key-required",
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        return {"ok": False, "reason": f"proxy unreachable: {exc}"}
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "reason": f"proxy returned invalid JSON: {exc}"}
+
+    # The proxy emits a `thinking` block BEFORE `text` on reasoning-heavy
+    # prompts, and only `text` on trivial ones — verified on this machine. Take
+    # the LAST text block: content[0] hands back the model's reasoning as file
+    # contents, and content[1] would IndexError on single-block replies.
+    blocks = data.get("content") or []
+    texts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+    if not texts:
+        return {"ok": False, "reason": "no text block in resolver response"}
+    raw = texts[-1]
+    thinking = next(
+        (b.get("thinking", "") for b in blocks if b.get("type") == "thinking"), ""
+    )
+
+    lines = raw.splitlines()
+    conf_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip().upper().startswith("CONFIDENCE"):
+            conf_idx = i
+            break
+    if conf_idx is None:
+        return {"ok": False, "reason": "resolver omitted the CONFIDENCE line"}
+
+    conf_line = lines[conf_idx]
+    low = conf_line.lower()
+    confidence = "high" if "high" in low else "medium" if "medium" in low else "low"
+
+    content = "\n".join(lines[:conf_idx]).strip()
+    # Strip a markdown fence if the model wrapped the file.
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1] if "\n" in content else ""
+        if content.rstrip().endswith("```"):
+            content = content.rstrip()[:-3]
+    content = content.strip()
+
+    if not content:
+        return {"ok": False, "reason": "resolver returned an empty file"}
+    if CONFLICT_MARKER_RE.search(content):
+        return {"ok": False, "reason": "resolver left conflict markers in the output"}
+
+    return {
+        "ok": True,
+        "content": content + "\n",
+        "confidence": confidence,
+        "reasoning": conf_line.strip(),
+        "thinking": thinking,
+    }
+
+
+# ── verification ─────────────────────────────────────────────────────────────
+def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
+    """Nothing is accepted unverified.
+
+    The suite is chosen by WHAT changed. An earlier draft gated everything on the
+    TypeScript typecheck, which would have accepted an AI resolution of a Python
+    file without ever executing it.
+    """
+    changed = list(changed)
+    py = [f for f in changed if f.endswith(".py")]
+    ts = [f for f in changed if f.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"))]
+    notes: list[str] = []
+
+    # Always: every changed Python file must at least parse. Cheap, and catches
+    # the syntax-error-bricks-the-CLI class the stock updater also guards.
+    import ast
+
+    for rel in py:
+        target = REPO_ROOT / rel
+        if not target.exists():
+            continue
+        try:
+            ast.parse(target.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError as exc:
+            return False, f"{rel} does not parse: {exc}"
+    if py:
+        notes.append(f"parsed {len(py)} python file(s)")
+
+    if quick:
+        return True, "; ".join(notes) or "parse-only (quick mode)"
+
+    if py:
+        proc = subprocess.run(
+            ["bash", "-lc", "cd '%s' && ./scripts/run_tests.sh" % REPO_ROOT.as_posix()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-25:])
+            return False, f"python tests failed:\n{tail}"
+        notes.append("python tests passed")
+
+    if ts:
+        proc = subprocess.run(
+            ["bash", "-lc", "cd '%s/apps/desktop' && npm run typecheck" % REPO_ROOT.as_posix()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-25:])
+            return False, f"typecheck failed:\n{tail}"
+        notes.append("typecheck passed")
+
+    return True, "; ".join(notes) or "no code files changed"
+
+
+# ── the guard backstop ───────────────────────────────────────────────────────
+def install_guard(git: Git) -> str:
+    """(Re)install the reference-transaction hook.
+
+    It lives in .git/hooks, which is NOT versioned — a fresh clone or a repaired
+    install silently loses it. Reinstalling on every sync makes the protection
+    self-healing. It covers the two installer scripts, which run entirely outside
+    this module.
+    """
+    src = REPO_ROOT / "scripts" / "fork-guard.sh"
+    if not src.exists():
+        return "fork-guard.sh missing; backstop NOT installed"
+    hooks = Path(git.out("rev-parse", "--absolute-git-dir") or str(REPO_ROOT / ".git")) / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    dst = hooks / "reference-transaction"
+    dst.write_bytes(src.read_bytes())
+    try:
+        os.chmod(dst, 0o755)
+    except OSError:
+        pass
+    return "guard installed"
+
+
+# ── main flow ────────────────────────────────────────────────────────────────
+def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
+         quick_verify: bool = False) -> int:
+    started = time.time()
+    rec = SyncRecord(started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    git = Git(REPO_ROOT)
+
+    def finish(status: str, msg: str, code: int) -> int:
+        rec.status = status
+        rec.message = msg
+        rec.duration_s = round(time.time() - started, 1)
+        rec.save()
+        prefix = {"ok": "✓", "up-to-date": "✓", "deferred": "⚠"}.get(status, "✗")
+        print(f"{prefix} {msg}")
+        return code
+
+    if not (REPO_ROOT / ".git").exists():
+        return finish("failed", f"not a git repository: {REPO_ROOT}", 1)
+
+    # rerere: a repeated conflict replays its previous resolution, so a recurring
+    # conflict costs one model call ever rather than one per sync.
+    git("config", "rerere.enabled", "true")
+    git("config", "rerere.autoUpdate", "true")
+    print(f"  {install_guard(git)}")
+
+    if not git.ok("remote", "get-url", "upstream"):
+        return finish("failed", "no 'upstream' remote configured", 1)
+
+    # A shallow clone has no merge-base, so merge/rebase cannot work at all. The
+    # installer clones with --depth 1, so this is a real state to handle.
+    if git.out("rev-parse", "--is-shallow-repository") == "true":
+        print("  → shallow clone; fetching full history")
+        if not git.ok("fetch", "--unshallow", "upstream"):
+            return finish("failed", "could not unshallow the repository", 1)
+
+    dirty = git.out("status", "--porcelain")
+    if dirty:
+        return finish("deferred",
+                      "working tree not clean; skipping sync (nothing was changed)", 0)
+
+    print(f"→ fetching upstream/{branch}")
+    if not git.ok("fetch", "upstream", branch):
+        return finish("failed", "git fetch upstream failed", 1)
+
+    behind = git.out("rev-list", "--count", f"HEAD..upstream/{branch}")
+    rec.upstream_commits = int(behind or 0)
+    if rec.upstream_commits == 0:
+        return finish("up-to-date", "already current with upstream", 0)
+
+    rec.fork_patches = int(git.out("rev-list", "--count", f"upstream/{branch}..HEAD") or 0)
+    rec.pre_sha = git.out("rev-parse", "HEAD")
+
+    # Rollback point BEFORE any history operation. A tag is a permanent named
+    # recovery point — recovery is "git checkout <tag>", not sha archaeology.
+    rec.rollback_tag = "pre-sync-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    git("tag", rec.rollback_tag, rec.pre_sha)
+    print(f"  rollback point: {rec.rollback_tag} -> {rec.pre_sha[:9]}")
+    print(f"  {rec.upstream_commits} upstream commit(s); {rec.fork_patches} fork patch(es)")
+
+    customizations = ""
+    cust = REPO_ROOT / "CUSTOMIZATIONS.md"
+    if cust.exists():
+        customizations = cust.read_text(encoding="utf-8", errors="replace")
+
+    def rollback() -> None:
+        """Restore without `reset --hard` (hard invariant)."""
+        if (Path(git.out("rev-parse", "--absolute-git-dir")) / "MERGE_HEAD").exists():
+            git("merge", "--abort", allow_rewrite=True)
+        if git.out("rev-parse", "HEAD") != rec.pre_sha:
+            git("update-ref", f"refs/heads/{branch}", rec.pre_sha, allow_rewrite=True)
+            git("checkout", "--", ".")
+        print(f"  restored to {rec.rollback_tag}")
+
+    # MERGE, not rebase — see the module docstring. This is what keeps the app's
+    # subsequent `pull --ff-only` clean and the destructive reset unreachable.
+    print(f"→ merging upstream/{branch}")
+    merged = git("merge", "--no-edit", f"upstream/{branch}", allow_rewrite=True)
+
+    if merged.returncode != 0:
+        conflicted = [f for f in git.out("diff", "--name-only", "--diff-filter=U").splitlines() if f]
+        rec.conflicts = conflicted
+        if not conflicted:
+            body = merged.stdout + merged.stderr
+            rec.report_path = _write_report("MERGE-FAILED", body)
+            rollback()
+            return finish("failed", f"merge failed with no conflicts; report: {rec.report_path}", 1)
+
+        print(f"  ⚠ conflict in {len(conflicted)} file(s): {', '.join(conflicted)}")
+
+        protected = [f for f in conflicted if f in HAND_RESOLVE_ONLY]
+        if protected:
+            body = (
+                "A conflict landed in the update mechanism itself. These files are\n"
+                "never auto-resolved: a wrong resolution can destroy the ability to\n"
+                "update at all.\n\n"
+                f"Files: {', '.join(protected)}\n"
+                f"Rollback point: {rec.rollback_tag} ({rec.pre_sha})\n\n"
+                "Resolve by hand, then: git commit\n\n"
+                "=== hunks ===\n" + git.out("diff")
+            )
+            rec.report_path = _write_report("HAND-RESOLVE-REQUIRED", body)
+            rollback()
+            return finish("deferred",
+                          f"update-path conflict needs a human: {', '.join(protected)}; "
+                          f"report: {rec.report_path}", 3)
+
+        if no_ai:
+            rec.report_path = _write_report("CONFLICT-NOAI", git.out("diff"))
+            rollback()
+            return finish("deferred", f"conflict and --no-ai set; report: {rec.report_path}", 4)
+
+        for rel in conflicted:
+            print(f"  → resolving {rel} with {RESOLVER_MODEL}")
+            target = REPO_ROOT / rel
+            body = target.read_text(encoding="utf-8", errors="replace")
+            res = resolve_with_ai(rel, body, customizations)
+
+            if not res.get("ok"):
+                rec.resolutions.append(asdict(Resolution(
+                    path=rel, confidence="none", reasoning=res.get("reason", ""),
+                    accepted=False)))
+                rec.report_path = _write_report(
+                    "RESOLUTION-FAILED",
+                    f"{res.get('reason')}\n\nRollback: {rec.rollback_tag}\n\n"
+                    "=== hunks ===\n" + git.out("diff"))
+                rollback()
+                return finish("failed",
+                              f"resolver failed on {rel}: {res.get('reason')}; "
+                              f"report: {rec.report_path}", 5)
+
+            accepted = res["confidence"] != "low"
+            rec.resolutions.append(asdict(Resolution(
+                path=rel,
+                confidence=res["confidence"],
+                reasoning=res["reasoning"],
+                accepted=accepted,
+                merged_preview=res["content"][:4000],
+            )))
+
+            if not accepted:
+                rec.report_path = _write_report(
+                    "LOW-CONFIDENCE",
+                    f"{res['reasoning']}\n\nRollback: {rec.rollback_tag}\n\n"
+                    "=== model reasoning ===\n" + (res.get("thinking") or "(none)") +
+                    "\n\n=== hunks ===\n" + git.out("diff"))
+                rollback()
+                return finish("deferred",
+                              f"low confidence on {rel}; not merged. "
+                              f"report: {rec.report_path}", 6)
+
+            target.write_text(res["content"], encoding="utf-8", newline="\n")
+            git("add", "--", rel)
+            print(f"    ✓ resolved (confidence: {res['confidence']})")
+
+        committed = git("commit", "--no-edit", allow_rewrite=True)
+        if committed.returncode != 0:
+            rec.report_path = _write_report("COMMIT-FAILED",
+                                            committed.stdout + committed.stderr)
+            rollback()
+            return finish("failed", f"could not commit the merge; report: {rec.report_path}", 7)
+
+    rec.post_sha = git.out("rev-parse", "HEAD")
+    print("  ✓ merge complete")
+
+    changed = [f for f in git.out("diff", "--name-only", f"{rec.pre_sha}..HEAD").splitlines() if f]
+    ok, notes = verify(changed, quick=quick_verify)
+    rec.verification = notes
+    if not ok:
+        rec.report_path = _write_report(
+            "VERIFICATION-FAILED",
+            f"{notes}\n\nRestored to {rec.rollback_tag} ({rec.pre_sha}).\n"
+            "The app still runs the previous, working build.")
+        rollback()
+        return finish("failed", f"verification failed: {notes.splitlines()[0]}; "
+                                f"report: {rec.report_path}", 8)
+    print(f"  ✓ verification: {notes}")
+
+    if dry_run:
+        return finish("ok", f"dry run: {rec.upstream_commits} commit(s) merged and verified, "
+                            f"not pushed (rollback: {rec.rollback_tag})", 0)
+
+    # Push so the fork commit exists somewhere other than this disk, and so the
+    # desktop app's update check sees the new commits on origin. No --force: a
+    # merge never rewrites history, so a plain push always succeeds.
+    print("→ pushing fork")
+    pushed = git("push", "origin", branch)
+    rec.pushed = pushed.returncode == 0
+    if not rec.pushed:
+        return finish("ok",
+                      f"merged and verified, but push failed: "
+                      f"{(pushed.stderr or pushed.stdout).strip().splitlines()[-1:] or ['unknown']}", 0)
+
+    return finish("ok",
+                  f"synced {rec.upstream_commits} upstream commit(s); "
+                  f"{rec.fork_patches} customization(s) intact; pushed", 0)
+
+
+def status(branch: str = "main") -> int:
+    """Print current fork state. Read-only; safe to run any time."""
+    git = Git(REPO_ROOT)
+    git("fetch", "--quiet", "upstream", branch)
+    print(f"repo:      {REPO_ROOT}")
+    print(f"HEAD:      {git.out('rev-parse', '--short', 'HEAD')} ({git.out('rev-parse', '--abbrev-ref', 'HEAD')})")
+    print(f"origin:    {git.out('remote', 'get-url', 'origin')}")
+    print(f"upstream:  {git.out('remote', 'get-url', 'upstream')}")
+    print(f"behind upstream: {git.out('rev-list', '--count', f'HEAD..upstream/{branch}')}")
+    print(f"fork patches:    {git.out('rev-list', '--count', f'upstream/{branch}..HEAD')}")
+    print(f"unpushed:        {git.out('rev-list', '--count', f'origin/{branch}..HEAD')}")
+    print(f"tree clean:      {'yes' if not git.out('status', '--porcelain') else 'NO'}")
+    guard = Path(git.out("rev-parse", "--absolute-git-dir")) / "hooks" / "reference-transaction"
+    print(f"guard installed: {'yes' if guard.exists() else 'NO'}")
+    if HISTORY_PATH.exists():
+        lines = [l for l in HISTORY_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+        print(f"sync history:    {len(lines)} entr(ies) at {HISTORY_PATH}")
+        if lines:
+            last = json.loads(lines[-1])
+            print(f"  last: {last.get('started_at')} -> {last.get('status')}: {last.get('message','')}")
+    else:
+        print("sync history:    (none yet)")
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="fork_sync",
+        description="Keep this fork current with upstream without losing customizations.",
+    )
+    ap.add_argument("command", nargs="?", default="sync", choices=["sync", "status"])
+    ap.add_argument("--branch", default="main")
+    ap.add_argument("--dry-run", action="store_true", help="merge and verify, but do not push")
+    ap.add_argument("--no-ai", action="store_true", help="defer on conflict instead of calling the resolver")
+    ap.add_argument("--quick-verify", action="store_true", help="parse check only; skip test suites")
+    args = ap.parse_args(argv)
+
+    if args.command == "status":
+        return status(args.branch)
+    return sync(args.branch, dry_run=args.dry_run, no_ai=args.no_ai,
+                quick_verify=args.quick_verify)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
