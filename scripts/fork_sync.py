@@ -64,6 +64,17 @@ from typing import Any, Iterable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Force UTF-8 on stdout/stderr. When this runs unattended under Windows Task
+# Scheduler with output redirected to a file, Python picks cp1252 and every
+# non-ASCII character in a status line raises UnicodeEncodeError — crashing the
+# sync on a *print statement*. Interactive runs never hit this because the
+# console is UTF-8, so it only appears once the job is actually automated.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # pragma: no cover - very old Python
+        pass
+
 PROXY_URL = "http://127.0.0.1:8081/v1/messages"
 RESOLVER_MODEL = "claude-opus-5"
 RESOLVER_MAX_TOKENS = 32000
