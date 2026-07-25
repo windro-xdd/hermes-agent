@@ -513,6 +513,29 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
     print(f"→ merging upstream/{branch}")
     merged = git("merge", "--no-edit", f"upstream/{branch}", allow_rewrite=True)
 
+    # Upstream sometimes ADDS a file that already exists locally as untracked
+    # (e.g. a test file a previous merge left behind). Git refuses the whole merge
+    # rather than conflicting on it. Untracked files are not our work and not in
+    # any history, but deleting them silently would be data loss — so move them
+    # aside into HERMES_HOME, report the location, and retry once.
+    if merged.returncode != 0 and "untracked working tree files would be overwritten" in (
+        merged.stdout + merged.stderr
+    ):
+        blocked = re.findall(r"^\t(.+)$", merged.stdout + merged.stderr, re.MULTILINE)
+        parked = _state_dir() / "parked" / datetime.now().strftime("%Y%m%d-%H%M%S")
+        moved: list[str] = []
+        for rel in blocked:
+            src = REPO_ROOT / rel.strip()
+            if not src.is_file():
+                continue
+            dst = parked / rel.strip()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            moved.append(rel.strip())
+        if moved:
+            print(f"  moved {len(moved)} untracked file(s) aside -> {parked}")
+            merged = git("merge", "--no-edit", f"upstream/{branch}", allow_rewrite=True)
+
     if merged.returncode != 0:
         conflicted = [f for f in git.out("diff", "--name-only", "--diff-filter=U").splitlines() if f]
         rec.conflicts = conflicted
