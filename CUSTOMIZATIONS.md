@@ -44,15 +44,18 @@ Never bundle two unrelated changes. The commit message is what the resolver mode
 reads, so write **why**, not what:
 
 ```
-custom(<id>): <one-line what>
+custom(<id>): <one-line what>        # or fix(<id>): / feat(<id>):
 
 Why: <the actual problem this solves>
 Mount: <file:symbol where it hooks into upstream>
+Depends on: <the upstream contracts this needs to keep working>
 Re-apply: <what to do if upstream moves or deletes that seam>
 ```
 
-### R3 — Every customization gets an entry in this file
-Added in the same commit as the code. No entry, no merge.
+### R3 — Every customization gets an entry in this file and the changelog
+Both added in the same commit as the code. No entry, no merge. The registry entry
+(this file) describes the patch as it exists **now**; the changelog entry records
+**when and why** it changed.
 
 ### R4 — Additive over destructive
 Prefer adding a branch, a wrapper, or a new function over rewriting or deleting
@@ -63,27 +66,78 @@ that code, and makes the resolver's job ambiguous.
 Use the libraries, patterns, error handling, and naming already in the file being
 touched. Do not introduce a new dependency for a customization.
 
-### R6 — Never `reset --hard` this fork
+### R6 — Build it to outlive the thing it hooks into
+A customization must keep working when *related* code changes around it. It is not
+enough that it works today. Concretely:
+
+- **Depend on the stable thing, not the incidental thing.** Hook a named function,
+  a documented config key, or a public interface — not a line number, a string
+  literal in a log message, a private `_helper`, a CSS class name, or the current
+  order of a list.
+- **Degrade, don't explode.** If the seam is missing, the customization logs once
+  and returns control to upstream. A customization must never be able to take the
+  app down — the worst case is "my feature is inactive", never "Hermes won't
+  start". Wrap the mount in a guard that tolerates absence.
+- **Assume the data will grow.** Handle a config key that isn't set, a model that
+  isn't in the map, a list with zero or many entries, a value of a new type. No
+  hardcoded counts, no assumption of exactly one of anything.
+- **Feature-detect instead of version-checking.** Ask "does this function exist /
+  does this key exist" rather than "is this version ≥ X".
+- **No copy-paste of upstream logic.** Duplicated logic silently goes stale when
+  upstream fixes a bug in the original. Call upstream's function; wrap it if you
+  must change behavior.
+- **Isolate the blast radius.** One customization must not be required for another
+  to work. If two need shared logic, that shared logic is its own new module both
+  import — not one reaching into the other.
+
+### R7 — Wire it properly, end to end
+A half-wired customization is worse than none, because it looks present and
+behaves inconsistently. Before a customization is considered done, every layer it
+touches must be connected and reachable:
+
+- The setting exists in config **and** has a sane default when absent.
+- The backend honors it **and** the UI reflects the real value (not a hardcoded
+  placeholder).
+- It applies on **every** path that should see it, not just the one path tested.
+  Find the sibling call sites.
+- It survives a restart, a profile switch, and a fresh install with no prior state.
+- Turning it off returns exactly upstream behavior, with nothing left behind.
+- It is reachable the way a user would actually reach it, not only via internals.
+
+### R8 — Document forward, not just backward
+Docs record what a future change will need to know, not only what was done. Every
+registry entry answers: what would break this, what to do when it breaks, what
+related work is expected next, and what was deliberately *not* done and why. A
+rejected alternative is worth writing down — without it, someone re-litigates the
+same decision in six months, or "fixes" something that was a conscious tradeoff.
+When a customization touches an area with known upstream churn, say so.
+
+### R9 — Every change gets a CHANGELOG entry
+New feature, bug fix, or a modification to built-in Hermes behavior — it goes in
+`CHANGELOG-FORK.md`, in the same commit, using the format defined there. No entry,
+no merge. See that file for the required fields.
+
+### R10 — Never `reset --hard` this fork
 It silently destroys fork commits. Not in scripts, not in the patched updater, not
 manually. Recovery point before any risky git operation is a **tag**, and the
 recovery move is `git rebase --abort` or checking out the tag — never a hard reset.
 
-### R7 — No AI-resolved conflict is trusted until it builds
+### R11 — No AI-resolved conflict is trusted until it builds
 A conflict resolved by the model is a *proposal*. It is accepted only after the
 desktop build and typecheck pass. Failure, or the model reporting low confidence,
 means abort, roll back, and notify. A failed update **defers**; it never ships a
 broken tree.
 
-### R8 — Secrets stay out of the repo
+### R12 — Secrets stay out of the repo
 API keys, tokens, and personal paths live in user data or the environment. This
 fork is on GitHub.
 
-### R9 — `git rerere` stays enabled
+### R13 — `git rerere` stays enabled
 `rerere.enabled` and `rerere.autoupdate` are on. Git remembers how a conflict was
 resolved and replays it automatically next time, so a recurring conflict costs one
 model call ever, not one per update.
 
-### R10 — The updater patch is the fragile one
+### R14 — The updater patch is the fragile one
 The patch that redirects the native Update button into `hermes-sync` modifies the
 very code that performs updates. If it ever conflicts, **a human resolves that one
 by hand** — the model must not auto-resolve a conflict in the update path, because
@@ -93,12 +147,72 @@ a wrong resolution there can break the ability to update at all.
 
 ## Registry
 
-### Core patches on this fork
-_None yet. Fork is currently identical to upstream `main`._
+### Entry template
+Every core patch gets a section in this shape. The last four fields are what make
+this file useful to a resolver model and to future work — do not skip them.
 
-| id | files | status |
-|---|---|---|
-| `updater-hermes-sync` | `hermes_cli/main.py` (mount only) + `scripts/hermes-sync.ps1` (new) | planned — Phase 1 Task 4 |
+```markdown
+#### `<id>` — <one-line what>
+- **Status:** active | planned | retired (retired: why, and when)
+- **Files:** new files (the logic) / upstream files (the mount, with the symbol)
+- **What:** the behavior change, from a user's point of view.
+- **Why:** the problem. Enough that someone can judge whether it still applies.
+- **Mount:** exactly where and how it hooks in — `file:symbol`, and what kind of
+  seam it is (config key, middleware hook, function call, UI registration).
+- **Depends on:** the upstream contracts it needs. This is the fragility list.
+- **If the seam moves:** what to do when upstream refactors it away. The single
+  most valuable field during a conflict.
+- **Degrades to:** what happens when the seam is missing — must be a safe
+  no-op, never a crash (R6).
+- **Next / related:** planned follow-ups, and other patches that touch this area.
+- **Deliberately not done:** rejected alternatives and why (R8).
+```
+
+### Core patches on this fork
+
+#### `customizations-registry` — fork rulebook, patch registry, changelog
+- **Status:** active
+- **Files:** `CUSTOMIZATIONS.md` + `CHANGELOG-FORK.md` (both new). No upstream file
+  touched.
+- **What:** documents the fork's rules and every customization.
+- **Why:** a diff does not record intent; without intent, a rebase conflict gets
+  resolved by guesswork and a customization silently dies.
+- **Mount:** none — root-level new file, conflict-free by construction.
+- **Depends on:** nothing.
+- **If the seam moves:** if upstream ever adds its own `CUSTOMIZATIONS.md`, rename
+  ours to `FORK-CUSTOMIZATIONS.md` and update the path in `hermes-sync`.
+- **Degrades to:** n/a — documentation.
+- **Next / related:** `CHANGELOG-FORK.md` (companion); read by
+  `updater-hermes-sync`.
+- **Deliberately not done:** not placed in `docs/` — upstream churns that
+  directory, and the resolver needs a predictable path.
+
+#### `updater-hermes-sync` — route the native Update button through `hermes-sync`
+- **Status:** planned — Phase 1 Task 4
+- **Files:** `scripts/hermes-sync.ps1` (new, the engine) + `hermes_cli/main.py`
+  (mount only, smallest possible hunk)
+- **What:** clicking Update rebases this fork's patches onto new upstream instead
+  of the stock pull/reset, so customizations survive.
+- **Why:** the stock path runs `git reset --hard origin/<branch>` on divergence,
+  which destroys every fork commit.
+- **Mount:** `hermes_cli/main.py` — the git update step inside the update command
+  (the `reset --hard origin/<branch>` site). Replace that step with a call out to
+  `hermes-sync`; do not touch detection.
+- **Depends on:** `upstream` remote existing; the update command still performing
+  its git step in one identifiable place; `PROJECT_ROOT`.
+- **If the seam moves:** **hand-resolve, never AI-resolve** (R14). Re-locate the
+  git update step by searching for `reset`, `--hard`, and `pull --ff-only` in
+  `hermes_cli/main.py`; re-apply the same substitution. Do not trust line numbers
+  from any doc — upstream moves them constantly (this patch's seam already moved
+  ~350 lines in one 233-commit catch-up).
+- **Degrades to:** if `hermes-sync` is missing or fails, the update **aborts and
+  notifies**. It must never fall through to `reset --hard`.
+- **Next / related:** detection at `main.py` (the `compare_branch` /
+  `upstream/<branch>` logic) is deliberately left alone so the native popup keeps
+  working — do not "simplify" the two together.
+- **Deliberately not done:** not patching the Electron self-update path in
+  `apps/desktop/electron/main.ts` as well; the CLI git step is the single
+  chokepoint and one seam is cheaper to maintain than two.
 
 ### Existing customizations that live in user data
 Registered for **resolver context only** — these are not fork commits and cannot
