@@ -190,8 +190,18 @@ this file useful to a resolver model and to future work — do not skip them.
 #### `fork-sync` — keep the fork current with upstream, losing nothing
 - **Status:** active
 - **Files:** `scripts/fork_sync.py` (the engine), `scripts/fork-guard.sh` (the
-  backstop hook), `~/.hermes/scripts/fork_sync_tick.py` (cron launcher, lives in
-  user data). **Zero upstream files modified.**
+  backstop hook), `tests/fork_sync/test_fork_sync_contract.py` (14 behavior
+  contracts), plus `%LOCALAPPDATA%\hermes\fork-sync-run.cmd` (Task Scheduler
+  wrapper, outside the repo). **Zero upstream files modified.**
+- **Scheduling:** Windows Task Scheduler task `Hermes Fork Sync`, daily 04:00.
+  NOT Hermes cron — `hermes cron list` warns that jobs never fire without the
+  gateway installed, and it is not installed here.
+- **Order of operations (this order IS the invariant):** merge → verify → deps
+  (only if manifests changed) → desktop rebuild (only if `apps/desktop/` changed)
+  → **then** push. This checkout *is* the running install, so the sync performs
+  the catch-up steps itself. Pushing earlier drives
+  `rev-list HEAD..origin/<branch>` to 0, which makes `hermes update` return early
+  and skip exactly those steps — see CHANGELOG defect 6.
 - **What:** a scheduled job merges new upstream commits into the fork, resolves
   any conflict with `claude-opus-5`, verifies, and pushes. Hermes's own update
   popup then fires normally and clicking Update is a plain fast-forward of
