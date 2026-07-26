@@ -341,6 +341,20 @@ def _import_check(rel_paths: list[str]) -> list[str]:
 BASELINE_PATH = _state_dir() / "test-baseline.json"
 
 
+def _repo_python() -> str:
+    """The repo venv's interpreter, falling back to the current one.
+
+    Checks both layouts: Windows venvs use Scripts/, POSIX uses bin/. Assuming
+    one layout is what made the test-harness probe fail silently on Windows.
+    """
+    for rel in ("venv/Scripts/python.exe", "venv/bin/python", ".venv/Scripts/python.exe",
+                ".venv/bin/python"):
+        cand = REPO_ROOT / rel
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+
 def _failing_tests(targets: list[str]) -> set[str]:
     """Run pytest on `targets` and return the set of failing test node ids.
 
@@ -865,9 +879,17 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
 
     if desktop_changed:
         print(f"→ {len(desktop_changed)} desktop file(s) changed; rebuilding")
+        # Invoke the CLI as a MODULE, not via a `hermes` shim. There is no
+        # venv/Scripts/hermes on this install (an earlier version hardcoded that
+        # path and would have failed on the first sync that touched the desktop),
+        # `hermes` is not on PATH under Task Scheduler, and `python cli.py
+        # desktop` is a different program entirely — cli.py treats "desktop" as a
+        # chat prompt and starts an agent. pyproject.toml maps the console script
+        # to hermes_cli.main:main, so -m hermes_cli.main is the stable form.
         build = subprocess.run(
-            ["bash", "-lc", "cd '%s' && ./venv/Scripts/hermes desktop "
-                            "--build-only --force-build" % REPO_ROOT.as_posix()],
+            [_repo_python(), "-m", "hermes_cli.main", "desktop",
+             "--build-only", "--force-build"],
+            cwd=str(REPO_ROOT),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=3600,
         )
