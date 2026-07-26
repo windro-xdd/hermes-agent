@@ -8035,8 +8035,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
                 if merge_upstream_into_fork(cwd, "main"):
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                # Say so once. A silently swallowed failure here is
+                # indistinguishable from "the merge declined", which would hide a
+                # permanently broken fork module for as long as it stayed broken.
+                print(f"  ℹ fork merge unavailable ({exc}); using standard behavior")
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")

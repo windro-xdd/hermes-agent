@@ -26,11 +26,18 @@ WHY IT DELEGATES INSTEAD OF IMPLEMENTING
     `__init__.py` upstream and adding one would be an upstream edit for no gain.
 
 WHY THE MERGE MUST DO ITS OWN DEPS + REBUILD
-    On the fork path, `hermes update` reaches `_sync_with_upstream_if_needed()`
-    only when `rev-list HEAD..origin/<branch>` is zero — the "nothing new from
-    my own fork" branch — and that branch returns before the dependency install
-    and the desktop rebuild. So those steps cannot be inherited from the caller;
-    `sync()` performs them itself. Do not "simplify" by deleting them there.
+    `hermes update` calls `_sync_with_upstream_if_needed()` from TWO places. The
+    one that matters here is inside `if commit_count == 0:` — the "nothing new
+    from my own fork" branch, which is the normal state of a fork that pushes its
+    own merges. That branch returns before the dependency install and the desktop
+    rebuild, so those steps cannot be inherited from the caller; `sync()` performs
+    them itself. Do not "simplify" by deleting them there.
+
+    The second call site sits after a successful origin pull, where `hermes update`
+    does run its own deps install and rebuild afterwards. Reaching it means origin
+    was ahead of local, which the sync never causes (it pushes last), so in
+    practice it is unreachable on this install. If it is ever reached the result is
+    duplicated work — slow, not wrong.
 
 DEGRADATION (R6)
     Every failure path returns False, which makes the caller fall through to
@@ -64,6 +71,7 @@ _ENGINE_MODULE_NAME = "_hermes_fork_sync_engine"
 MERGED = "merged"          # upstream came in; the caller should not print its own message
 UNCHANGED = "unchanged"    # engine ran but HEAD did not move (nothing to do / it declined)
 FAILED = "failed"          # engine ran, failed, and restored its rollback point
+CRASHED = "crashed"        # engine raised: it reported, but the tree state is UNKNOWN
 UNAVAILABLE = "unavailable"  # disabled, or the engine could not be loaded at all
 
 _FALSEY = {"0", "false", "no", "off", ""}
@@ -164,6 +172,13 @@ def merge_outcome(cwd: Path, branch: str = "main") -> str:
         # The engine records its own crashes when invoked through its CLI; this
         # path is a direct call, so record it the same way rather than letting an
         # exception escape into `hermes update`.
+        #
+        # Reported as CRASHED, not FAILED, and the distinction is not cosmetic: on
+        # a handled failure the engine has restored its rollback point, so "your
+        # work is intact" is true. On a crash it has not — record_crash explicitly
+        # does not roll back, because the tree state is unknown. Telling the user
+        # everything is fine in exactly the case where nobody knows would be the
+        # worst thing this module could say.
         recorder = getattr(engine, "record_crash", None)
         if callable(recorder):
             try:
@@ -172,7 +187,7 @@ def merge_outcome(cwd: Path, branch: str = "main") -> str:
                 recorder(traceback.format_exc())
             except Exception:
                 pass
-        return FAILED
+        return CRASHED
     after = _head_sha(Path(cwd))
 
     if code != 0:
@@ -198,7 +213,16 @@ def merge_upstream_into_fork(cwd: Path, branch: str = "main") -> bool:
     if outcome == MERGED:
         return True
     if outcome == FAILED:
+        # The engine restored its rollback point on this path, so this is a fact,
+        # not a hope.
         print("  ℹ Your customizations are intact and the previous build is "
               "still running.", flush=True)
+        return True
+    if outcome == CRASHED:
+        print("  ⚠ The fork merge crashed. The repository state was NOT rolled "
+              "back automatically — check it before updating again:", flush=True)
+        print("      python scripts/fork_sync.py status", flush=True)
+        print("    The crash report (with the rollback tag to recover from) is in "
+              "the fork-sync reports directory.", flush=True)
         return True
     return False

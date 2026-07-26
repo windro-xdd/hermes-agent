@@ -2,7 +2,13 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { parseBehindCount, resolveForkUpstreamStatus, shouldProbeUpstream } from './fork-upstream'
+import {
+  isForkMergeEnabled,
+  parseBehindCount,
+  resolveForkUpstreamStatus,
+  shouldProbeUpstream,
+  withForkUpstreamStatus
+} from './fork-upstream'
 
 // FAIL-BEFORE: without this module checkUpdates() only ever measured
 // HEAD..origin/<branch>. On a fork that merges upstream itself and pushes, that
@@ -107,4 +113,106 @@ test('the probe only runs when origin found nothing', () => {
 test('a missing git runner is handled, not thrown', async () => {
   assert.equal(await resolveForkUpstreamStatus({ branch: 'main' }), null)
   assert.equal(await resolveForkUpstreamStatus({ git: gitStub([]), branch: '' }), null)
+})
+
+// ── the off switch must cover BOTH halves ────────────────────────────────────
+// FAIL-BEFORE: HERMES_FORK_MERGE=0 disabled only the Python merge. The probe kept
+// running, so the popup advertised upstream commits while the Update button did
+// nothing — the half-wired state the fork's R7 explicitly forbids.
+
+test('the off switch matches the Python half, value for value', () => {
+  for (const off of ['0', 'false', 'no', 'off', '', ' OFF ']) {
+    assert.equal(isForkMergeEnabled({ HERMES_FORK_MERGE: off }), false, `expected off for ${JSON.stringify(off)}`)
+  }
+  for (const on of ['1', 'true', 'yes']) {
+    assert.equal(isForkMergeEnabled({ HERMES_FORK_MERGE: on }), true)
+  }
+  assert.equal(isForkMergeEnabled({}), true, 'absent must mean enabled')
+})
+
+// ── the call-site wrapper ────────────────────────────────────────────────────
+const originStatus = (extra = {}) => ({
+  supported: true,
+  branch: 'main',
+  behind: 0,
+  currentSha: 'local',
+  targetSha: 'local',
+  commits: [],
+  ...extra
+})
+
+function forkGit() {
+  return gitStub([
+    ['remote get-url upstream', ok('https://github.com/NousResearch/hermes-agent.git')],
+    ['rev-list', ok('43')],
+    ['rev-parse', ok('upstreamsha')]
+  ])
+}
+
+test('decorates the payload when origin found nothing but upstream is ahead', async () => {
+  const status = await withForkUpstreamStatus(
+    Promise.resolve(originStatus()),
+    forkGit(),
+    { env: {} }
+  )
+  assert.equal(status.behind, 43)
+  assert.equal(status.targetSha, 'upstreamsha')
+  assert.equal(status.forkUpstream, 'upstream/main')
+  assert.equal(status.branch, 'main', 'the rest of the payload must survive')
+})
+
+test('the off switch disables the probe entirely', async () => {
+  const git = forkGit()
+  const status = await withForkUpstreamStatus(
+    Promise.resolve(originStatus()),
+    git,
+    { env: { HERMES_FORK_MERGE: '0' } }
+  )
+  assert.equal(status.behind, 0, 'must report exactly what origin said')
+  assert.equal(status.forkUpstream, undefined)
+  assert.deepEqual(git.calls, [], 'must not even talk to git when switched off')
+})
+
+test('leaves the payload alone when origin already has something to report', async () => {
+  const git = forkGit()
+  const status = await withForkUpstreamStatus(
+    Promise.resolve(originStatus({ behind: 4 })),
+    git,
+    { env: {} }
+  )
+  assert.equal(status.behind, 4)
+  assert.deepEqual(git.calls, [], 'origin stays authoritative when it has an answer')
+})
+
+test('leaves an errored or unsupported payload alone', async () => {
+  const git = forkGit()
+  const errored = await withForkUpstreamStatus(
+    Promise.resolve({ supported: true, branch: 'main', error: 'fetch-failed' }),
+    git,
+    { env: {} }
+  )
+  assert.equal(errored.error, 'fetch-failed')
+  const unsupported = await withForkUpstreamStatus(
+    Promise.resolve({ supported: false, reason: 'not-a-git-checkout' }),
+    git,
+    { env: {} }
+  )
+  assert.equal(unsupported.supported, false)
+  assert.deepEqual(git.calls, [], 'a broken check must not be papered over with a probe')
+})
+
+test('a rejection passes through to the caller', async () => {
+  await assert.rejects(
+    () => withForkUpstreamStatus(Promise.reject(new Error('check exploded')), forkGit(), { env: {} }),
+    /check exploded/
+  )
+})
+
+test('a probe failure returns the original payload untouched', async () => {
+  const git = async () => {
+    throw new Error('git is broken')
+  }
+  const status = await withForkUpstreamStatus(Promise.resolve(originStatus()), git, { env: {} })
+  assert.equal(status.behind, 0)
+  assert.equal(status.forkUpstream, undefined)
 })

@@ -26,6 +26,7 @@ Newest first.
 
 | Date | Type | Change |
 |---|---|---|
+| 2026-07-26 | Fixed | [Audit corrections to the fork-aware update patch](entries/2026-07-26-10-audit-corrections-to-fork-aware-update.md) |
 | 2026-07-26 | Added | [The native Update button now actually updates the fork](entries/2026-07-26-09-fork-aware-update.md) |
 | 2026-07-26 | Fixed | [The sync crashed after every real merge (undefined variable)](entries/2026-07-26-08-sync-crashed-after-every-real-merge.md) |
 | 2026-07-26 | Fixed | [Projects appearing that were never created (git repo auto-discovery)](entries/2026-07-26-07-disable-git-repo-auto-discovery.md) |

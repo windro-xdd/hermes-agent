@@ -30,6 +30,18 @@
 
 const DEFAULT_UPSTREAM_REMOTE = 'upstream'
 
+// Same switch, same values, as hermes_cli/fork_merge.py::is_enabled. Both halves
+// MUST honor it: with the merge disabled but the probe still running, the popup
+// would advertise commits and the Update button would do nothing — the half-wired
+// state that is worse than not having the feature at all.
+const FALSEY = new Set(['0', 'false', 'no', 'off', ''])
+
+function isForkMergeEnabled(env = process.env) {
+  const raw = env && env.HERMES_FORK_MERGE
+  if (raw === undefined || raw === null) return true
+  return !FALSEY.has(String(raw).trim().toLowerCase())
+}
+
 // Parse `git rev-list --count` output. Anything non-numeric means "no idea",
 // which must read as zero so a garbled result cannot invent a fake update.
 function parseBehindCount(countStr) {
@@ -84,4 +96,35 @@ async function resolveForkUpstreamStatus({ git = null, branch = '', remote = DEF
   }
 }
 
-export { DEFAULT_UPSTREAM_REMOTE, parseBehindCount, resolveForkUpstreamStatus, shouldProbeUpstream }
+// The whole mount, in one call. Wraps the result of checkUpdates() so that
+// function stays byte-identical to upstream — the update-check payload is built
+// by upstream code and only decorated here. A rejection from `pending` is passed
+// straight through so the caller's existing .catch() still handles it.
+async function withForkUpstreamStatus(pending, git, { env = process.env } = {}) {
+  const status = await pending
+  try {
+    if (!isForkMergeEnabled(env)) return status
+    if (!status || typeof status !== 'object') return status
+    // Only decorate a healthy origin answer that found nothing. An unsupported
+    // checkout or a failed origin fetch is reported as-is: a fork probe cannot
+    // make those situations better and hiding them would be worse.
+    if (status.supported === false || status.error) return status
+    if (!shouldProbeUpstream({ originBehind: status.behind })) return status
+
+    const fork = await resolveForkUpstreamStatus({ git, branch: status.branch })
+    if (!fork) return status
+
+    return { ...status, behind: fork.behind, targetSha: fork.targetSha, forkUpstream: fork.ref }
+  } catch {
+    return status
+  }
+}
+
+export {
+  DEFAULT_UPSTREAM_REMOTE,
+  isForkMergeEnabled,
+  parseBehindCount,
+  resolveForkUpstreamStatus,
+  shouldProbeUpstream,
+  withForkUpstreamStatus
+}

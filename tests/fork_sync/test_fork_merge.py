@@ -100,7 +100,7 @@ def test_engine_exception_is_contained_and_recorded(monkeypatch, tmp_path):
     monkeypatch.setattr(fork_merge, "load_engine", lambda root=None: engine)
     monkeypatch.setattr(fork_merge, "_head_sha", lambda cwd: "aaa")
 
-    assert fork_merge.merge_outcome(tmp_path) == fork_merge.FAILED
+    assert fork_merge.merge_outcome(tmp_path) == fork_merge.CRASHED
     assert engine.crashes, "a direct-call crash must still be recorded"
     # And the caller-facing wrapper must not raise either.
     assert fork_merge.merge_upstream_into_fork(tmp_path) is True
@@ -135,7 +135,25 @@ def test_failed_is_handled_not_silent(monkeypatch, tmp_path, capsys):
     assert fork_merge.merge_outcome(tmp_path) == fork_merge.FAILED
     assert fork_merge.merge_upstream_into_fork(tmp_path) is True
     out = capsys.readouterr().out.lower()
-    assert "intact" in out, "a failure must reassure the user their work survived"
+    assert "intact" in out, "a handled failure must say the work survived — it did"
+
+
+def test_a_crash_does_not_claim_the_tree_is_safe(monkeypatch, tmp_path, capsys):
+    """A crash is NOT a handled failure. record_crash deliberately does not roll
+    back, so the tree state is unknown — claiming 'your customizations are intact'
+    there would be a lie in the one case where nobody knows."""
+    monkeypatch.delenv("HERMES_FORK_MERGE", raising=False)
+    engine = _fake_engine(0, raises=True)
+    monkeypatch.setattr(fork_merge, "load_engine", lambda root=None: engine)
+    monkeypatch.setattr(fork_merge, "_head_sha", lambda cwd: "same")
+
+    assert fork_merge.merge_outcome(tmp_path) == fork_merge.CRASHED
+    assert fork_merge.merge_upstream_into_fork(tmp_path) is True
+
+    out = capsys.readouterr().out.lower()
+    assert "intact" not in out, "a crash must not claim the tree is intact"
+    assert "not rolled back" in out, "a crash must say the tree was not rolled back"
+    assert "status" in out, "a crash must point at how to check the state"
 
 
 def test_branch_is_passed_through(monkeypatch, tmp_path):
@@ -347,8 +365,9 @@ def test_end_to_end_update_merges_upstream_and_keeps_fork_work(
 
 
 def test_mount_survives_a_broken_fork_module(upstream_sync_env, monkeypatch, tmp_path, capsys):
-    """If the fork module raises on import or call, `hermes update` must still
-    complete with upstream's behavior. Updating can never be breakable by us."""
+    """If the fork merge raises when called, `hermes update` must still complete
+    with upstream's behavior — and must SAY it happened rather than swallowing it,
+    or a permanently broken module is indistinguishable from one that declined."""
     hermes_main = upstream_sync_env
     _set_counts(monkeypatch, hermes_main, origin_ahead=26, upstream_ahead=43)
 
@@ -356,6 +375,20 @@ def test_mount_survives_a_broken_fork_module(upstream_sync_env, monkeypatch, tmp
         raise RuntimeError("fork module is broken")
 
     monkeypatch.setattr(fork_merge, "merge_upstream_into_fork", explode)
+
+    hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
+    out = capsys.readouterr().out
+    assert "Skipping upstream sync to preserve your changes." in out
+    assert "fork merge unavailable" in out, "the failure must be reported once"
+    assert "fork module is broken" in out, "the reason must be visible"
+
+
+def test_mount_survives_an_unimportable_fork_module(upstream_sync_env, monkeypatch, tmp_path, capsys):
+    """The import itself failing must also fall through — the previous test only
+    covered a raising call, which is a different failure."""
+    hermes_main = upstream_sync_env
+    _set_counts(monkeypatch, hermes_main, origin_ahead=26, upstream_ahead=43)
+    monkeypatch.setitem(sys.modules, "hermes_cli.fork_merge", None)  # forces ImportError
 
     hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
     assert "Skipping upstream sync to preserve your changes." in capsys.readouterr().out

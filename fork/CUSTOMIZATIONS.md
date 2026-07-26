@@ -256,19 +256,38 @@ to update at all.
 1. **The upstream edit is a call, never logic.** The fork's code lives in a new
    file (`hermes_cli/fork_merge.py`, `apps/desktop/electron/fork-upstream.ts`).
    The edit inside an upstream file is the smallest possible mount that reaches
-   it, and it must be *additive* — upstream's original lines stay in place as the
-   fallback, not deleted and not re-indented.
+   it, and it must be *additive wherever additive is possible* — upstream's
+   original lines stay in place as the fallback, not deleted and not re-indented.
+   Where a single existing line genuinely must change (wrapping a call), that is
+   allowed, but exactly one line and never a block. Measured against
+   `upstream/main`: `hermes_cli/main.py` +20/−0, `apps/desktop/electron/main.ts`
+   +9/−1 (the one removal is the wrapped call itself).
 2. **It degrades to exactly upstream behavior.** If the fork module is missing,
    switched off, throws, or declines, the original code path runs unchanged. A
-   test asserts the fallback, not just the happy path.
+   test asserts the fallback, not just the happy path. **Every mount honors the
+   same off switch.** A switch that disables one half and leaves the other running
+   produces the half-wired state R7 forbids — for this patch that would be a popup
+   advertising commits over a button that does nothing.
 3. **`hermes_cli/main.py` stays on `HAND_RESOLVE_ONLY`.** A conflict there is
    never AI-resolved: it is the file that contains `reset --hard`, and a subtly
    wrong resolution is the one failure this project exists to prevent. The sync
    defers, writes a HAND-RESOLVE-REQUIRED report with the hunks, and restores the
    rollback point. Nothing is lost; updates pause until someone re-applies the
-   mount. The mount region has seen **one** upstream change in 365 days, so this
-   is a rare, bounded cost — and the registry entry below tells a future agent
-   exactly how to re-apply it.
+   mount — and the registry entry below tells a future agent exactly how.
+
+   **Churn at that mount, measured with `git log -L` against `upstream/main`
+   (corrected 2026-07-26 after an audit found the first figure was measured on a
+   narrower range than its paired number):** the 9 lines the mount sits in saw
+   **1** change in 365 days; the enclosing `_sync_with_upstream_if_needed` saw
+   **6**, of which one is the function's own creation and two are a Windows fix
+   and its revert — so **3 substantive changes in a year**. Low, bounded, not
+   "one".
+
+   **`apps/desktop/electron/main.ts` is deliberately NOT on the list.** That is a
+   considered asymmetry, not an oversight: its mount region changes ~5×/90d, so
+   listing it would defer real syncs several times a year for a file whose worst
+   failure mode is *the popup goes quiet* — visible, non-destructive, and
+   recoverable. `main.py` holds the destructive reset; that is the difference.
 4. **`fork-guard` stays installed.** It is the only protection that does not
    depend on the patch being correct: if a resolution ever silently drops the
    mount and an update falls back to `reset --hard`, the hook refuses the ref
@@ -375,8 +394,17 @@ this file useful to a resolver model and to future work — do not skip them.
 - **If the seam moves:** there is no seam to move. If upstream ever changes the
   update flow so a merged fork still cannot fast-forward, re-check the table
   above before reaching for a patch.
-- **Degrades to:** any failure → rollback tag restored, nothing pushed, app keeps
-  running the previous build. A failed sync **defers**; it never bricks.
+- **Degrades to:** any *handled* failure → rollback tag restored, nothing pushed,
+  app keeps running the previous build. A failed sync **defers**; it never bricks.
+  **One exception, added 2026-07-26:** an *unhandled* exception is caught by
+  `record_crash()`, which writes a `CRASHED-*` report and a history entry but
+  **deliberately does not roll back** — at crash time the tree state is unknown and
+  blind recovery could destroy a good merge. So after a crash the working tree may
+  hold a completed merge, an aborted one, or a partial one. The report names the
+  rollback tag; `python scripts/fork_sync.py status` is the first thing to run.
+  Callers must not tell the user their tree is safe on that path (see
+  `hermes_cli/fork_merge.py`, which distinguishes `FAILED` from `CRASHED` for
+  exactly this reason).
 - **Next / related:** a Settings page showing sync history and AI resolutions is
   deliberately deferred (see below). Sync history is already recorded as JSONL at
   `~/.hermes/fork-sync/history.jsonl`, so a UI can be added later without
@@ -435,10 +463,13 @@ this file useful to a resolver model and to future work — do not skip them.
     behind the `upstream` remote the checkout is, for the update indicator.
   - `tests/fork_sync/test_fork_merge.py` (new) — 24 contracts, including a real
     three-repo end-to-end merge.
-  - **Upstream mounts (2 files, both additive):**
-    `hermes_cli/main.py::_sync_with_upstream_if_needed` — one block inside the
-    `origin_ahead > 0` branch; `apps/desktop/electron/main.ts::checkUpdates` — one
-    import plus a probe before the existing return.
+  - **Upstream mounts (2 files):**
+    `hermes_cli/main.py::_sync_with_upstream_if_needed` — one additive block
+    inside the `origin_ahead > 0` branch (+20/−0);
+    `apps/desktop/electron/main.ts` — one import plus **one wrapped line** at the
+    `ipcMain.handle('hermes:updates:check', ...)` handler (+9/−1). `checkUpdates()`
+    itself is byte-identical to upstream: the decoration happens to its *result*,
+    at its single call site, not inside it.
 - **What:** clicking Update in the desktop app (or running `hermes update`) now
   merges new upstream commits into the fork, resolves conflicts with the AI
   resolver, verifies, installs dependencies and rebuilds the desktop when the
@@ -455,15 +486,23 @@ this file useful to a resolver model and to future work — do not skip them.
 - **Mount:**
   - `hermes_cli/main.py::_sync_with_upstream_if_needed`, inside `if origin_ahead >
     0:`, gated on `upstream_ahead > 0`. Function-level seam, not a line number.
-    Upstream's original six print lines and `return` are kept immediately below as
-    the fallback.
-  - `apps/desktop/electron/main.ts::checkUpdates`, after `resolveBehindCount`,
-    gated on the origin count being 0 so the non-fork path is untouched.
+    Upstream's original block — five `print()` calls (the first one bare) and its
+    `return` — is kept immediately below as the fallback, unmodified and at the
+    same indentation. Preserve exactly those lines when re-applying after a
+    conflict.
+  - `apps/desktop/electron/main.ts`, the `hermes:updates:check` IPC handler — its
+    single call to `checkUpdates()` is wrapped in `withForkUpstreamStatus()`, which
+    decorates the returned payload and passes a rejection straight through to the
+    handler's existing `.catch`. Gated on the origin count being 0 so the non-fork
+    path is untouched, and on the same `HERMES_FORK_MERGE` switch as the Python
+    half. Mounted at the call site rather than inside `checkUpdates()` so that
+    function needs no edit at all.
 - **Depends on:** the *names* `_sync_with_upstream_if_needed`, `origin_ahead`,
-  `upstream_ahead` (main.py); `checkUpdates`, `runGit`, `resolveBehindCount`
-  (electron/main.ts); `scripts/fork_sync.py` exposing `sync()`, `REPO_ROOT`, and
-  `record_crash()`. An `upstream` remote must exist — which is also what upstream's
-  own fork detection requires.
+    `upstream_ahead` (main.py); the `hermes:updates:check` IPC channel name plus
+  `checkUpdates`, `runGit` and `resolveUpdateRoot` (electron/main.ts);
+  `scripts/fork_sync.py` exposing `sync()`, `REPO_ROOT`, and `record_crash()`. An
+  `upstream` remote must exist — which is also what upstream's own fork detection
+  requires.
 - **If the seam moves:** re-apply by finding where `hermes update` decides what to
   do about a fork. Two questions to answer in the new code: *(a)* where does it
   give up because the fork has its own commits — insert
@@ -492,11 +531,16 @@ this file useful to a resolver model and to future work — do not skip them.
   - **No patch to the installers.** See R15.
   - **No second implementation of merge/resolve/verify.** The adapter delegates to
     the engine the scheduled job already exercises nightly. A copy would go stale.
-  - **The engine's deps-install and desktop-rebuild steps were NOT removed.** It
-    looks like duplication of what `hermes update` does, and it is not: on the fork
-    path `hermes update` returns before its own deps and rebuild steps, so the
-    engine must perform them. Removing them ships merged source against a stale
-    venv and a stale app bundle.
+  - **The engine's deps-install and desktop-rebuild steps were NOT removed.** They
+    look like duplication of what `hermes update` does. On the call site that
+    matters — inside `if commit_count == 0:`, the normal state of a fork that
+    pushes its own merges — `hermes update` returns before its own deps and rebuild
+    steps, so the engine must perform them; removing them ships merged source
+    against a stale venv and a stale app bundle. There is a **second** call site
+    after a successful origin pull where `hermes update` does run those steps
+    itself. Reaching it requires origin to be ahead of local, which the sync never
+    causes because it pushes last; if it is ever reached the cost is duplicated
+    work, not a wrong result.
 
 ### Existing customizations that live in user data
 Registered for **resolver context only** — these are not fork commits and cannot
