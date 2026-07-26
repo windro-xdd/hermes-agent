@@ -260,11 +260,21 @@ to update at all.
    original lines stay in place as the fallback, not deleted and not re-indented.
    Where a single existing line genuinely must change (wrapping a call), that is
    allowed, but exactly one line and never a block. Measured against
-   the **merge base** (`git diff $(git merge-base upstream/main HEAD)..HEAD
-   --numstat`, never a two-dot diff against `upstream/main` — that attributes
-   upstream's own newer commits to the fork and reported 111 files instead of 21):
-   `hermes_cli/main.py` +23/−0, `apps/desktop/electron/main.ts` +9/−1, where the
-   one removal is the wrapped call itself.
+   Shape, not counts: `hermes_cli/main.py` is **one added block with zero
+   removals**; `apps/desktop/electron/main.ts` is **one added import plus one
+   wrapped line**, and that wrapped line is its only removal. Raw line counts are
+   deliberately not quoted here — they went stale three times in one session, each
+   time in the commit that was fixing the previous stale number. Get the current
+   figures with:
+
+   ```bash
+   git diff $(git merge-base upstream/main HEAD)..HEAD --numstat -- \
+     hermes_cli/main.py apps/desktop/electron/main.ts
+   ```
+
+   Use the **merge base**, never a two-dot diff against `upstream/main`: that
+   attributes upstream's own newer commits to the fork (111 files instead of 21
+   when measured while 66 commits behind).
 2. **It degrades to exactly upstream behavior.** If the fork module is missing,
    switched off, throws, or declines, the original code path runs unchanged. A
    test asserts the fallback, not just the happy path. **Every mount honors the
@@ -468,9 +478,9 @@ this file useful to a resolver model and to future work — do not skip them.
     three-repo end-to-end merge.
   - **Upstream mounts (2 files):**
     `hermes_cli/main.py::_sync_with_upstream_if_needed` — one additive block
-    inside the `origin_ahead > 0` branch (+23/−0 against the merge base);
+    inside the `origin_ahead > 0` branch, no removals;
     `apps/desktop/electron/main.ts` — one import plus **one wrapped line** at the
-    `ipcMain.handle('hermes:updates:check', ...)` handler (+9/−1). `checkUpdates()`
+    `ipcMain.handle('hermes:updates:check', ...)` handler. `checkUpdates()`
     itself is byte-identical to upstream: the decoration happens to its *result*,
     at its single call site, not inside it.
 - **What:** clicking Update in the desktop app (or running `hermes update`) now
