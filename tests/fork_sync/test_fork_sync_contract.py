@@ -20,6 +20,7 @@ Run: python -m pytest tests/fork_sync/ -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -394,3 +395,89 @@ def test_missing_test_harness_is_not_reported_as_failure(engine, monkeypatch):
     assert ok, f"a missing harness must not fail verification (notes: {notes})"
     assert "skipped" in notes.lower(), \
         f"the note must state the suite was skipped, got: {notes!r}"
+
+
+# ── the catch-up steps must actually run ─────────────────────────────────────
+def test_followups_use_the_merged_diff(engine, fork, monkeypatch, tmp_path):
+    """A merge touching apps/desktop must rebuild; one touching a manifest must
+    install dependencies.
+
+    Regression: the block making those two decisions read a ``changed_files``
+    name that was never assigned anywhere in the module, so sync() raised
+    NameError immediately after the merge — before the push, the dependency
+    install, and the rebuild — leaving no history entry and no report. It never
+    showed up interactively because every run after that code landed had nothing
+    new to merge, and a crash there is silent (sync alerts are not delivered
+    anywhere yet). This test drives a real merge that touches both file classes
+    and asserts the two commands are actually invoked.
+    """
+    monkeypatch.setattr(engine, "REPO_ROOT", fork)
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "history.jsonl")
+    monkeypatch.setattr(engine, "REPORT_DIR", tmp_path / "reports")
+    # Verification is covered by its own tests; stub it so this one stays about
+    # the follow-up decisions.
+    monkeypatch.setattr(engine, "verify", lambda changed, quick=False: (True, "stubbed"))
+
+    up = Path(_git(fork, "remote", "get-url", "upstream"))
+    (up / "package.json").write_text('{"name":"x"}\n', encoding="utf-8")
+    desktop_src = up / "apps" / "desktop" / "src"
+    desktop_src.mkdir(parents=True)
+    (desktop_src / "app.ts").write_text("export const a = 1\n", encoding="utf-8")
+    _git(up, "add", ".")
+    _git(up, "commit", "-qm", "upstream: desktop change + manifest change")
+
+    real_run = subprocess.run
+    invoked: list[str] = []
+
+    def fake_run(cmd, *a, **kw):
+        joined = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        # Intercept only the two expensive catch-up commands; every git call
+        # must still run for real or the merge under test does not happen.
+        if "npm install" in joined or "--force-build" in joined:
+            invoked.append(joined)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+
+    code = engine.sync("master")
+
+    assert code == 0, "a clean verified merge must succeed"
+    assert any("npm install" in c for c in invoked), (
+        "a merge that changes package.json must install dependencies; "
+        f"commands invoked: {invoked}"
+    )
+    assert any("--force-build" in c for c in invoked), (
+        "a merge that changes apps/desktop must rebuild the desktop app; "
+        f"commands invoked: {invoked}"
+    )
+
+
+def test_unhandled_crash_is_recorded(engine, monkeypatch, tmp_path):
+    """A crash must leave a history entry and a report, not just a traceback.
+
+    Sync failure alerts are not delivered anywhere yet, so an unrecorded crash
+    is completely silent: the scheduled job fails every night while `status`
+    still looks healthy. `record_crash` is what turns that into evidence.
+    """
+    monkeypatch.setattr(engine, "HISTORY_PATH", tmp_path / "history.jsonl")
+    monkeypatch.setattr(engine, "REPORT_DIR", tmp_path / "reports")
+
+    def boom(*a, **kw):
+        raise RuntimeError("induced failure")
+
+    monkeypatch.setattr(engine, "sync", boom)
+    code = engine.main(["sync"])
+
+    assert code != 0, "a crash must not report success"
+    entries = [
+        l for l in (tmp_path / "history.jsonl").read_text(encoding="utf-8").splitlines()
+        if l.strip()
+    ]
+    assert entries, "a crash must append a history entry"
+    record = json.loads(entries[-1])
+    assert record["status"] == "crashed"
+    assert record["report_path"], "a crash must write a report file"
+    assert Path(record["report_path"]).is_file()
+    assert "induced failure" in Path(record["report_path"]).read_text(encoding="utf-8"), \
+        "the report must contain the traceback"

@@ -26,6 +26,7 @@ Newest first.
 
 | Date | Type | Change |
 |---|---|---|
+| 2026-07-26 | Fixed | [The sync crashed after every real merge (undefined variable)](entries/2026-07-26-08-sync-crashed-after-every-real-merge.md) |
 | 2026-07-26 | Fixed | [Projects appearing that were never created (git repo auto-discovery)](entries/2026-07-26-07-disable-git-repo-auto-discovery.md) |
 | 2026-07-26 | Infrastructure | [Require a branch workflow, and make the changelog rule self-contained](entries/2026-07-26-06-require-branch-workflow-and-complete-the-changelog-rule.md) |
 | 2026-07-26 | Infrastructure | [Move fork docs into a `fork/` namespace, one file per change](entries/2026-07-26-05-move-fork-docs-into-a-fork-namespace.md) |
