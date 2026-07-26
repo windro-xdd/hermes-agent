@@ -213,6 +213,62 @@ def test_update_mechanism_is_never_ai_resolved(engine):
         assert required in protected, f"{required} must be hand-resolve only"
 
 
+# ── the gate must compare to a baseline, not demand a green suite ────────────
+def test_preexisting_failures_do_not_block(engine, monkeypatch, tmp_path):
+    """Upstream ships tests that already fail on Windows (POSIX path
+    assumptions; 11 confirmed on a pristine upstream clone). Demanding zero
+    failures blocks every sync on breakage we did not cause — the same
+    false-alarm trap as treating a missing harness as a failure."""
+    known = {"tests/x.py::test_a", "tests/x.py::test_b"}
+    monkeypatch.setattr(engine, "BASELINE_PATH", tmp_path / "baseline.json")
+    engine._write_baseline(known)
+    monkeypatch.setattr(engine, "_failing_tests", lambda targets: set(known))
+    monkeypatch.setattr(engine, "_import_check", lambda paths: [])
+
+    real_run = engine.subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        joined = " ".join(map(str, cmd))
+        if "import pytest" in joined:
+            class R:
+                returncode = 0
+                stdout = stderr = ""
+            return R()
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    ok, notes = engine.verify(["agent/example.py"])
+    assert ok, f"pre-existing failures must not block a sync (notes: {notes})"
+    assert "pre-existing" in notes
+
+
+def test_new_failure_blocks_the_sync(engine, monkeypatch, tmp_path):
+    """The other half of the contract: a failure the merge INTRODUCED must
+    block. A gate that never fails is not a gate."""
+    monkeypatch.setattr(engine, "BASELINE_PATH", tmp_path / "baseline.json")
+    engine._write_baseline({"tests/x.py::test_a"})
+    monkeypatch.setattr(
+        engine, "_failing_tests",
+        lambda targets: {"tests/x.py::test_a", "tests/x.py::test_NEW"},
+    )
+    monkeypatch.setattr(engine, "_import_check", lambda paths: [])
+
+    real_run = engine.subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        if "import pytest" in " ".join(map(str, cmd)):
+            class R:
+                returncode = 0
+                stdout = stderr = ""
+            return R()
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    ok, notes = engine.verify(["agent/example.py"])
+    assert not ok, "a newly-failing test must block the sync"
+    assert "test_NEW" in notes
+
+
 # ── verification must distinguish "cannot run" from "failed" ─────────────────
 def test_missing_test_harness_is_not_reported_as_failure(engine, monkeypatch):
     """pytest is absent on some installs; conflating 'harness unavailable' with
