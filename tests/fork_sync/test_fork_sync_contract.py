@@ -262,6 +262,43 @@ def test_preexisting_failures_do_not_block(engine, monkeypatch, tmp_path):
     assert "pre-existing" in notes
 
 
+def test_failure_confirmed_preexisting_is_absorbed(engine, monkeypatch, tmp_path):
+    """A failure absent from the baseline but ALSO failing pre-merge must be
+    absorbed, not reported as merge damage.
+
+    Seeding the baseline from a fixed list missed tests that later syncs pulled
+    into scope — two skills tests were reported as newly broken when both fail on
+    the pre-merge tree as well."""
+    monkeypatch.setattr(engine, "BASELINE_PATH", tmp_path / "baseline.json")
+    engine._write_baseline({"tests/x.py::test_known"})
+    monkeypatch.setattr(
+        engine, "_failing_tests",
+        lambda targets: {"tests/x.py::test_known", "tests/y.py::test_also_broken_before"},
+    )
+    # The suspect fails on the pre-merge tree too.
+    monkeypatch.setattr(
+        engine, "_failing_on_baseline_tree",
+        lambda ids: {"tests/y.py::test_also_broken_before"},
+    )
+    monkeypatch.setattr(engine, "_import_check", lambda paths: [])
+
+    real_run = engine.subprocess.run
+
+    def fake_run(cmd, *a, **kw):
+        if "import pytest" in " ".join(map(str, cmd)):
+            class R:
+                returncode = 0
+                stdout = stderr = ""
+            return R()
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    ok, notes = engine.verify(["agent/example.py"])
+    assert ok, f"a confirmed pre-existing failure must not block (notes: {notes})"
+    assert "tests/y.py::test_also_broken_before" in engine._read_baseline(), \
+        "the absorbed failure should be remembered so the next sync is cheaper"
+
+
 def test_new_failure_blocks_the_sync(engine, monkeypatch, tmp_path):
     """The other half of the contract: a failure the merge INTRODUCED must
     block. A gate that never fails is not a gate."""

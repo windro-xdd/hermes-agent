@@ -367,6 +367,48 @@ def _failing_tests(targets: list[str]) -> set[str]:
     return failing
 
 
+def _failing_on_baseline_tree(node_ids: list[str]) -> set[str]:
+    """Of `node_ids`, which already fail on the PRE-MERGE tree?
+
+    Called only when a test looks newly broken. Runs the suspects against a
+    pristine worktree checked out at the rollback point, so "the merge broke
+    this" is proven rather than assumed. A `git stash`-style approach would risk
+    the live tree; a detached worktree touches nothing.
+    """
+    if not node_ids:
+        return set()
+    git = Git(REPO_ROOT)
+    pre = git.out("rev-parse", "HEAD~1") if git.ok("rev-parse", "HEAD~1") else ""
+    # Prefer the sync's own rollback tag when present (most recent wins).
+    tags = [t for t in git.out("tag", "--list", "pre-sync-*").splitlines() if t]
+    if tags:
+        pre = git.out("rev-parse", sorted(tags)[-1])
+    if not pre:
+        return set()
+
+    wt = _state_dir() / "baseline-worktree"
+    git("worktree", "remove", "--force", str(wt), allow_rewrite=True)
+    if not git.ok("worktree", "add", "--detach", "--quiet", str(wt), pre):
+        return set()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", *node_ids,
+             "-q", "--no-header", "-p", "no:cacheprovider"],
+            cwd=str(wt), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=1200,
+        )
+        out = proc.stdout + proc.stderr
+        return {
+            line.split(" ", 1)[1].split(" - ")[0].strip()
+            for line in out.splitlines()
+            if line.startswith(("FAILED ", "ERROR "))
+        }
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    finally:
+        git("worktree", "remove", "--force", str(wt), allow_rewrite=True)
+
+
 def _read_baseline() -> set[str]:
     try:
         return set(json.loads(BASELINE_PATH.read_text(encoding="utf-8")))
@@ -453,6 +495,22 @@ def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
                         targets.append(cand.relative_to(REPO_ROOT).as_posix())
                 failed_now = _failing_tests(targets)
 
+                # Self-healing baseline: a failure is only "new" if the SAME test
+                # passes on the pre-merge tree. Seeding the baseline from a fixed
+                # list was fragile — it missed tests that a later sync happened to
+                # pull into scope (two skills tests surfaced this way and were
+                # wrongly reported as merge damage, when both fail pre-merge too).
+                #
+                # Re-running the suspects against the rollback point costs one
+                # extra pytest invocation and only happens when something looks
+                # broken, so the common path is unaffected.
+                candidates = failed_now - _read_baseline()
+                if candidates:
+                    confirmed_preexisting = _failing_on_baseline_tree(sorted(candidates))
+                    if confirmed_preexisting:
+                        _write_baseline(_read_baseline() | confirmed_preexisting)
+                        failed_now -= confirmed_preexisting
+
                 # Compare against the PRE-MERGE baseline instead of demanding a
                 # fully green suite. Upstream ships tests that already fail on
                 # this platform (POSIX path assumptions: 11 confirmed failures in
@@ -471,8 +529,14 @@ def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
                         f"\n  {listed}"
                     )
 
+                # Re-read: absorbing a confirmed pre-existing failure above may
+                # have widened the baseline, and writing `failed_now` blindly
+                # would drop that record (the absorbed test is subtracted from
+                # failed_now, so it would silently vanish and be re-investigated
+                # on every future sync).
+                baseline = _read_baseline()
                 fixed = sorted(baseline - failed_now)
-                _write_baseline(failed_now)
+                _write_baseline(baseline | failed_now)
                 note = f"no new test failures ({len(failed_now)} pre-existing"
                 if fixed:
                     note += f", {len(fixed)} newly fixed upstream"
