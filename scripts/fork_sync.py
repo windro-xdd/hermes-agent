@@ -55,6 +55,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, asdict
@@ -871,10 +872,17 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
     # post-pull steps `hermes update` would normally perform must happen here.
     # Only run what the diff actually requires — a rebuild costs minutes.
     followups: list[str] = []
-    dep_files = [f for f in changed_files
+    # `changed` is the merged diff computed above (pre_sha..HEAD). An earlier
+    # revision read a `changed_files` name that was never assigned anywhere, so
+    # this whole block raised NameError on the first sync that actually merged
+    # something — after the merge, before the push, with no history entry and no
+    # report. Never reproduced interactively because the runs that followed the
+    # fix had nothing new to merge. Covered by
+    # tests/fork_sync/test_fork_sync_contract.py::test_followups_use_the_merged_diff.
+    dep_files = [f for f in changed
                  if Path(f).name in ("pyproject.toml", "requirements.txt",
                                      "package.json", "package-lock.json")]
-    desktop_changed = [f for f in changed_files if f.startswith("apps/desktop/")]
+    desktop_changed = [f for f in changed if f.startswith("apps/desktop/")]
 
     if dep_files:
         print("→ dependency manifests changed; installing")
@@ -981,6 +989,44 @@ def status(branch: str = "main") -> int:
     return 0
 
 
+def record_crash(tb: str) -> int:
+    """Turn an unhandled exception into a report + a history entry.
+
+    Without this, a bug anywhere in `sync()` exits with a bare traceback: no
+    history entry, no report, and — because sync alerts are not delivered
+    anywhere yet — no signal at all. The scheduled job would keep failing every
+    night while `status` still looked healthy. A crash must leave the same
+    evidence trail as a handled failure.
+
+    Deliberately does NOT attempt a rollback. At crash time the tree state is
+    unknown, and `sync()` already restores its rollback point on every failure
+    path it controls; blind recovery here could destroy a good merge. The report
+    names the tag so recovery is one command.
+    """
+    rec = SyncRecord(started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    rec.status = "crashed"
+    try:
+        tags = Git(REPO_ROOT).out("tag", "--list", "pre-sync-*", "--sort=-creatordate")
+        latest_tag = tags.splitlines()[0] if tags else ""
+    except Exception:
+        latest_tag = ""
+    body = (
+        "fork_sync crashed with an unhandled exception.\n\n"
+        f"Most recent rollback point: {latest_tag or '(none found)'}\n"
+        "The merge may or may not have completed. Check with:\n"
+        "  python scripts/fork_sync.py status\n"
+        f"Recover the previous state with:\n  git checkout {latest_tag or '<pre-sync tag>'}\n\n"
+        "=== traceback ===\n" + tb
+    )
+    rec.report_path = _write_report("CRASHED", body)
+    rec.rollback_tag = latest_tag
+    rec.message = f"crashed: {tb.strip().splitlines()[-1] if tb.strip() else 'unknown'}"
+    rec.save()
+    print(f"✗ {rec.message}")
+    print(f"  report: {rec.report_path}")
+    return 9
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="fork_sync",
@@ -998,8 +1044,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         return status(args.branch)
     if args.command == "push":
         return push_after_update(args.branch)
-    return sync(args.branch, dry_run=args.dry_run, no_ai=args.no_ai,
-                quick_verify=args.quick_verify)
+    try:
+        return sync(args.branch, dry_run=args.dry_run, no_ai=args.no_ai,
+                    quick_verify=args.quick_verify)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        return record_crash(traceback.format_exc())
 
 
 if __name__ == "__main__":

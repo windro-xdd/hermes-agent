@@ -240,11 +240,45 @@ fork is on GitHub.
 resolved and replays it automatically next time, so a recurring conflict costs one
 model call ever, not one per update.
 
-### R15 — The updater patch is the fragile one
-The patch that redirects the native Update button into `hermes-sync` modifies the
-very code that performs updates. If it ever conflicts, **a human resolves that one
-by hand** — the model must not auto-resolve a conflict in the update path, because
-a wrong resolution there can break the ability to update at all.
+### R15 — The update path may be patched, but only on these terms
+**Superseded 2026-07-26.** The original rule said the update path must never be
+patched at all. That was written when the sync was expected to be invisible; it
+made the native Update button permanently inert, because `hermes update`
+deliberately refuses to merge upstream into a fork that carries its own commits
+(`_sync_with_upstream_if_needed`, the `origin_ahead > 0` branch). The fork's whole
+purpose is carrying its own commits, so "never patch the update path" meant
+"updates never arrive through the UI".
+
+Patching it is now allowed, under four conditions. They exist because the risk the
+old rule was protecting against is real: a wrong edit here can break the ability
+to update at all.
+
+1. **The upstream edit is a call, never logic.** The fork's code lives in a new
+   file (`hermes_cli/fork_merge.py`, `apps/desktop/electron/fork-upstream.ts`).
+   The edit inside an upstream file is the smallest possible mount that reaches
+   it, and it must be *additive* — upstream's original lines stay in place as the
+   fallback, not deleted and not re-indented.
+2. **It degrades to exactly upstream behavior.** If the fork module is missing,
+   switched off, throws, or declines, the original code path runs unchanged. A
+   test asserts the fallback, not just the happy path.
+3. **`hermes_cli/main.py` stays on `HAND_RESOLVE_ONLY`.** A conflict there is
+   never AI-resolved: it is the file that contains `reset --hard`, and a subtly
+   wrong resolution is the one failure this project exists to prevent. The sync
+   defers, writes a HAND-RESOLVE-REQUIRED report with the hunks, and restores the
+   rollback point. Nothing is lost; updates pause until someone re-applies the
+   mount. The mount region has seen **one** upstream change in 365 days, so this
+   is a rare, bounded cost — and the registry entry below tells a future agent
+   exactly how to re-apply it.
+4. **`fork-guard` stays installed.** It is the only protection that does not
+   depend on the patch being correct: if a resolution ever silently drops the
+   mount and an update falls back to `reset --hard`, the hook refuses the ref
+   move and the update fails loudly instead of eating fork commits.
+
+The installers (`scripts/install.ps1`, `scripts/install.sh`) were deliberately
+**not** patched. Their destructive reset only fires when the local checkout has
+diverged from *origin* — not from upstream — which the sync never causes, and
+`fork-guard` covers the remaining edge. Patching them would add a second
+hand-resolve-only surface for no gain.
 
 ---
 
@@ -348,8 +382,13 @@ this file useful to a resolver model and to future work — do not skip them.
   `~/.hermes/fork-sync/history.jsonl`, so a UI can be added later without
   changing the engine.
 - **Deliberately not done:**
-  - **No patch to `hermes_cli/main.py`.** Unnecessary under merge, and it is the
-    single highest-churn file in the repo.
+  - **~~No patch to `hermes_cli/main.py`.~~ Superseded 2026-07-26** by
+    `fork-aware-update`. The claim was that merging made a patch unnecessary. That
+    was true for *protecting* the fork and false for *delivering* updates: with no
+    patch, `hermes update` reaches its fork branch and deliberately declines to
+    merge, so the native popup and Update button did nothing at all. The mount is
+    now one additive block in the lowest-churn region of that file. See the
+    `fork-aware-update` entry below.
   - **No Settings page (yet).** It would mean editing the second-highest-churn
     directory (206 commits/90d) permanently, for a read-only log viewer. A chat
     notification plus the JSONL history delivers the same information at zero
@@ -386,6 +425,78 @@ this file useful to a resolver model and to future work — do not skip them.
 - **Deliberately not done:** not attempting to detect the reset *mode* — the
   information does not reach the hook. An attempt to infer it from working-tree
   state wrongly un-blocked the real attack.
+
+#### `fork-aware-update` — make the native Update button actually update the fork
+- **Status:** active
+- **Files:**
+  - `hermes_cli/fork_merge.py` (new) — the adapter. Loads `scripts/fork_sync.py`
+    by path and calls its `sync()`. Classifies the outcome by whether HEAD moved.
+  - `apps/desktop/electron/fork-upstream.ts` (new) + `.test.ts` — resolves how far
+    behind the `upstream` remote the checkout is, for the update indicator.
+  - `tests/fork_sync/test_fork_merge.py` (new) — 24 contracts, including a real
+    three-repo end-to-end merge.
+  - **Upstream mounts (2 files, both additive):**
+    `hermes_cli/main.py::_sync_with_upstream_if_needed` — one block inside the
+    `origin_ahead > 0` branch; `apps/desktop/electron/main.ts::checkUpdates` — one
+    import plus a probe before the existing return.
+- **What:** clicking Update in the desktop app (or running `hermes update`) now
+  merges new upstream commits into the fork, resolves conflicts with the AI
+  resolver, verifies, installs dependencies and rebuilds the desktop when the
+  merge touched them, then pushes. The popup fires when **Nous** ships, not when
+  the user's own fork moves.
+- **Why:** two separate defects made the update UI inert on a fork.
+  1. `_sync_with_upstream_if_needed` fetches upstream, compares, and when the fork
+     has commits of its own prints *"Skipping upstream sync to preserve your
+     changes"* and returns. That is the normal state of this fork, so the merge
+     never happened.
+  2. `checkUpdates()` measures `HEAD..origin/<branch>` — distance from the remote
+     the fork **pushes to**. The sync pushes there, so the count is permanently 0:
+     "Already up to date", popup silent, Update button inert.
+- **Mount:**
+  - `hermes_cli/main.py::_sync_with_upstream_if_needed`, inside `if origin_ahead >
+    0:`, gated on `upstream_ahead > 0`. Function-level seam, not a line number.
+    Upstream's original six print lines and `return` are kept immediately below as
+    the fallback.
+  - `apps/desktop/electron/main.ts::checkUpdates`, after `resolveBehindCount`,
+    gated on the origin count being 0 so the non-fork path is untouched.
+- **Depends on:** the *names* `_sync_with_upstream_if_needed`, `origin_ahead`,
+  `upstream_ahead` (main.py); `checkUpdates`, `runGit`, `resolveBehindCount`
+  (electron/main.ts); `scripts/fork_sync.py` exposing `sync()`, `REPO_ROOT`, and
+  `record_crash()`. An `upstream` remote must exist — which is also what upstream's
+  own fork detection requires.
+- **If the seam moves:** re-apply by finding where `hermes update` decides what to
+  do about a fork. Two questions to answer in the new code: *(a)* where does it
+  give up because the fork has its own commits — insert
+  `merge_upstream_into_fork(cwd, "main")` there and return on True; *(b)* where
+  does it count how far behind it is — make that count consider `upstream/<branch>`
+  when the origin count is 0. If upstream ever merges its own fork-merge support,
+  **retire this patch** rather than stacking on top of it. If the whole function
+  disappears, the fallback is a `hermes update` that no longer offers upstream
+  commits — annoying, not dangerous, and the nightly scheduled sync still merges.
+- **Degrades to:** exactly upstream behavior. Missing module, `HERMES_FORK_MERGE=0`,
+  an exception, a dirty tree, or a path mismatch between the caller and the
+  engine's own checkout all return "not handled", and upstream's original lines
+  run. Asserted by `test_mount_falls_back_to_upstream_message` and
+  `test_mount_survives_a_broken_fork_module`.
+- **Next / related:** the nightly scheduled sync now overlaps this — if it keeps
+  merging at 04:00, the popup rarely has anything to show. Deciding whether the
+  nightly becomes check-and-notify (so the user drives updates from the button) is
+  an open question, not a defect. Sync failure alerts are still delivered nowhere;
+  that remains the biggest gap.
+- **Deliberately not done:**
+  - **No commit list for the fork case.** `readCommitLog()` is hardcoded to the
+    origin range and widening it would mean editing an upstream function plus its
+    call site for a cosmetic list. The official-SSH branch of `checkUpdates()`
+    already returns `commits: []`, so an empty list is an established shape. The
+    count, which is what drives the popup, is exact.
+  - **No patch to the installers.** See R15.
+  - **No second implementation of merge/resolve/verify.** The adapter delegates to
+    the engine the scheduled job already exercises nightly. A copy would go stale.
+  - **The engine's deps-install and desktop-rebuild steps were NOT removed.** It
+    looks like duplication of what `hermes update` does, and it is not: on the fork
+    path `hermes update` returns before its own deps and rebuild steps, so the
+    engine must perform them. Removing them ships merged source against a stale
+    venv and a stale app bundle.
 
 ### Existing customizations that live in user data
 Registered for **resolver context only** — these are not fork commits and cannot
