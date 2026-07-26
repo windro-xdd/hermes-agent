@@ -96,11 +96,24 @@ CONFLICT_MARKER_RE = re.compile(r"^(<{7}|={7}|>{7})", re.MULTILINE)
 
 
 def _state_dir() -> Path:
-    """Where sync history and reports live (outside the repo, so never committed)."""
-    base = os.environ.get("HERMES_HOME") or os.path.join(
-        os.environ.get("LOCALAPPDATA", str(Path.home())), "hermes"
-    )
-    return Path(base) / "fork-sync"
+    """Where sync history, reports, and the test baseline live.
+
+    Outside the repo, so this state is never committed and never becomes conflict
+    surface.
+
+    Deliberately NOT derived from HERMES_HOME. That variable is set in an
+    interactive shell (pointing at a per-profile dir like
+    .../hermes/profiles/dev-xd) but NOT under Windows Task Scheduler, so the two
+    contexts wrote to different directories. The scheduled run then could not see
+    the baseline the interactive run had seeded, and reported 12 known-failing
+    tests as "newly failing" — blocking every sync. History and reports were
+    fragmenting the same way.
+
+    Anchored to the install root instead: one location, same answer in every
+    context, and correct regardless of which profile is active (this state
+    describes the CHECKOUT, not a profile).
+    """
+    return REPO_ROOT.parent / "fork-sync"
 
 
 HISTORY_PATH = _state_dir() / "history.jsonl"

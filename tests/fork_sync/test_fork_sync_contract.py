@@ -213,6 +213,26 @@ def test_update_mechanism_is_never_ai_resolved(engine):
         assert required in protected, f"{required} must be hand-resolve only"
 
 
+# ── state must live in ONE place regardless of environment ───────────────────
+def test_state_dir_is_environment_independent(engine, monkeypatch):
+    """State must not move when HERMES_HOME is set or unset.
+
+    It IS set in an interactive shell and is NOT set under Windows Task
+    Scheduler. Deriving the state dir from it split history/reports/baseline
+    across two directories: the scheduled run could not see the baseline the
+    interactive run wrote, so 12 known-failing tests read as "newly failing" and
+    every sync was blocked.
+    """
+    monkeypatch.setenv("HERMES_HOME", r"C:\some\profile\dir")
+    with_home = engine._state_dir()
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    without_home = engine._state_dir()
+    assert with_home == without_home, (
+        "the state dir must not depend on HERMES_HOME — the scheduled and "
+        "interactive contexts would disagree and the baseline would be invisible"
+    )
+
+
 # ── the gate must compare to a baseline, not demand a green suite ────────────
 def test_preexisting_failures_do_not_block(engine, monkeypatch, tmp_path):
     """Upstream ships tests that already fail on Windows (POSIX path
