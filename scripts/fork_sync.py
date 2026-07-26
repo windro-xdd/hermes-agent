@@ -845,12 +845,56 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
     #
     # The fork is pushed separately, after the app has caught up: see
     # `push_after_update()` below, which the post-update path calls.
-    behind_origin = git.out("rev-list", "--count", f"origin/{branch}..HEAD")
+    # The merge lands in the RUNNING install (this checkout IS the app), so the
+    # post-pull steps `hermes update` would normally perform must happen here.
+    # Only run what the diff actually requires — a rebuild costs minutes.
+    followups: list[str] = []
+    dep_files = [f for f in changed_files
+                 if Path(f).name in ("pyproject.toml", "requirements.txt",
+                                     "package.json", "package-lock.json")]
+    desktop_changed = [f for f in changed_files if f.startswith("apps/desktop/")]
+
+    if dep_files:
+        print("→ dependency manifests changed; installing")
+        dep = subprocess.run(
+            ["bash", "-lc", "cd '%s' && npm install --no-fund --no-audit "
+                            "--progress=false --workspaces=false" % REPO_ROOT.as_posix()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        followups.append("deps installed" if dep.returncode == 0 else "DEP INSTALL FAILED")
+
+    if desktop_changed:
+        print(f"→ {len(desktop_changed)} desktop file(s) changed; rebuilding")
+        build = subprocess.run(
+            ["bash", "-lc", "cd '%s' && ./venv/Scripts/hermes desktop "
+                            "--build-only --force-build" % REPO_ROOT.as_posix()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=3600,
+        )
+        if build.returncode == 0:
+            followups.append("desktop rebuilt")
+        else:
+            # The merge is verified and the source is good; only the bundle is
+            # stale. Report loudly but do NOT roll back — reverting verified code
+            # because a build step failed would be the worse outcome.
+            tail = "\n".join((build.stdout + build.stderr).splitlines()[-15:])
+            rec.report_path = _write_report("REBUILD-FAILED", tail)
+            followups.append(f"DESKTOP REBUILD FAILED (see {rec.report_path})")
+
+    # Push last: the local install is now fully caught up, so making origin equal
+    # to HEAD no longer hides anything. Pushing BEFORE this point was defect #6 —
+    # it drove `rev-list HEAD..origin/<branch>` to 0, which made `hermes update`
+    # return early and skip exactly the two steps performed above.
+    print("→ pushing fork")
+    pushed = git("push", "origin", branch)
+    rec.pushed = pushed.returncode == 0
+    if not rec.pushed:
+        followups.append("push failed (local tree is fine; retry with: fork_sync push)")
+
+    suffix = ("; " + ", ".join(followups)) if followups else ""
     return finish("ok",
-                  f"merged {rec.upstream_commits} upstream commit(s); "
-                  f"{rec.fork_patches} customization(s) intact; "
-                  f"{behind_origin} commit(s) staged locally — "
-                  "Hermes will offer the update, and the fork is pushed after it applies", 0)
+                  f"synced {rec.upstream_commits} upstream commit(s); "
+                  f"{rec.fork_patches} customization(s) intact{suffix}", 0)
 
 
 def push_after_update(branch: str = "main") -> int:

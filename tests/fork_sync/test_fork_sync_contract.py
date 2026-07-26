@@ -90,23 +90,39 @@ def fork(tmp_path: Path) -> Path:
 
 
 # ── the invariant that broke the update flow ─────────────────────────────────
-def test_sync_does_not_push(engine):
-    """`sync()` must never push.
+def test_push_happens_after_the_catch_up_steps(engine):
+    """The push must come AFTER the dependency install and desktop rebuild.
 
-    Pushing makes `rev-list HEAD..origin/<branch>` zero, which makes
-    `hermes update` return early (main.py:11406 -> 11513) and skip dependency
-    install (11648) and the desktop rebuild (electron/main.ts:3165) — leaving
-    merged source running against stale deps, while the UI reports "up to date".
+    Original defect: sync() pushed as its last act *before* anything else, which
+    drove `rev-list HEAD..origin/<branch>` to 0 and made `hermes update` return
+    early (main.py:11406 -> 11513), skipping dependency install (11648) and the
+    desktop rebuild (electron/main.ts:3165).
+
+    The real fix is not "never push" — this checkout IS the running install, so
+    the sync performs those catch-up steps itself and then pushes. What must hold
+    is the ORDER: nothing may push before the install has caught up, or the same
+    early-return hides the work.
     """
     src = ENGINE.read_text(encoding="utf-8")
-    sync_body = src.split("def sync(", 1)[1].split("\ndef ", 1)[0]
-    pushes = [
-        line.strip() for line in sync_body.splitlines()
-        if '"push"' in line and not line.strip().startswith("#")
-    ]
-    assert not pushes, (
-        "sync() must not push — it makes `hermes update` skip deps and the "
-        f"desktop rebuild. Offending line(s): {pushes}"
+    sync_body = src.split("def sync(", 1)[1].split("\ndef push_after_update", 1)[0]
+    lines = [l for l in sync_body.splitlines() if not l.strip().startswith("#")]
+
+    def first_index(needle: str) -> int:
+        for i, l in enumerate(lines):
+            if needle in l:
+                return i
+        return -1
+
+    push_at = first_index('"push", "origin"')
+    rebuild_at = first_index("--force-build")
+    deps_at = first_index("npm install")
+
+    assert push_at != -1, "sync() must eventually push the fork"
+    assert rebuild_at != -1 and deps_at != -1, \
+        "sync() must perform the catch-up steps itself (this checkout is the app)"
+    assert push_at > rebuild_at and push_at > deps_at, (
+        "the push must come AFTER deps+rebuild; pushing first makes "
+        "`hermes update` return early and skip them"
     )
 
 
