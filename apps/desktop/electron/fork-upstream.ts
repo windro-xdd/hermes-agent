@@ -51,9 +51,12 @@ function parseBehindCount(countStr) {
 
 // Should the fork-upstream probe run at all? Only when the ordinary origin
 // comparison found nothing — origin staying authoritative when it has something
-// to say keeps the normal (non-fork) path byte-identical.
-function shouldProbeUpstream({ originBehind, supported = true }) {
-  return Boolean(supported) && parseBehindCount(originBehind) === 0
+// to say keeps the normal (non-fork) path byte-identical. Payload health
+// (unsupported checkout, failed origin fetch) is the caller's check, not this
+// one: an earlier version took a `supported` flag here as well, which was dead
+// in production because withForkUpstreamStatus already rejects those payloads.
+function shouldProbeUpstream({ originBehind }) {
+  return parseBehindCount(originBehind) === 0
 }
 
 // `git` is injected: an async (args[]) => { code, stdout, stderr } runner. Keeps
@@ -85,12 +88,15 @@ async function resolveForkUpstreamStatus({ git = null, branch = '', remote = DEF
     const behind = parseBehindCount(countRes && countRes.stdout)
     if (behind === 0) return null
 
-    return {
-      behind,
-      remote,
-      ref,
-      targetSha: String((shaRes && shaRes.stdout) || '').trim()
-    }
+    // The sha is not optional. The renderer refuses to raise the notification
+    // when targetSha is empty, so decorating a payload with a count but no sha
+    // produces "43 commits behind" with a silent popup — the exact failure this
+    // feature exists to remove. Without a usable sha, report nothing and let
+    // origin's answer stand.
+    const targetSha = shaRes && shaRes.code === 0 ? String(shaRes.stdout || '').trim() : ''
+    if (!targetSha) return null
+
+    return { behind, remote, ref, targetSha }
   } catch {
     return null
   }

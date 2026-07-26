@@ -56,7 +56,15 @@ def _fake_engine(sync_result, *, raises: bool = False) -> types.ModuleType:
 # ── the off switch ───────────────────────────────────────────────────────────
 @pytest.mark.parametrize("value,expected", [
     ("0", False), ("false", False), ("no", False), ("off", False), ("", False),
-    ("1", True), ("true", True), ("yes", True),
+    # Case and surrounding whitespace must not change the answer. The desktop half
+    # (apps/desktop/electron/fork-upstream.ts::isForkMergeEnabled) covers the same
+    # values, so a divergence here is a divergence between the two halves of the
+    # switch — which is what produces the half-wired popup R7 forbids.
+    ("OFF", False), ("False", False), (" 0 ", False), ("  Off  ", False),
+    ("1", True), ("true", True), ("yes", True), ("TRUE", True), (" yes ", True),
+    # Anything unrecognized means enabled: the default must be "the fork keeps
+    # updating", never "silently stop".
+    ("2", True), ("disabled", True),
 ])
 def test_off_switch_values(monkeypatch, value, expected):
     monkeypatch.setenv("HERMES_FORK_MERGE", value)
@@ -135,7 +143,12 @@ def test_failed_is_handled_not_silent(monkeypatch, tmp_path, capsys):
     assert fork_merge.merge_outcome(tmp_path) == fork_merge.FAILED
     assert fork_merge.merge_upstream_into_fork(tmp_path) is True
     out = capsys.readouterr().out.lower()
-    assert "intact" in out, "a handled failure must say the work survived — it did"
+    # Promise only what the engine guarantees: rollback never uses reset --hard so
+    # no commit is lost, but it does not check its own git return codes, so the
+    # working tree is not guaranteed clean. Claiming a clean tree here would be
+    # the same class of lie as the crash path.
+    assert "no fork commits were lost" in out
+    assert "working tree may" in out, "the weaker tree guarantee must be stated"
 
 
 def test_a_crash_does_not_claim_the_tree_is_safe(monkeypatch, tmp_path, capsys):
@@ -385,10 +398,20 @@ def test_mount_survives_a_broken_fork_module(upstream_sync_env, monkeypatch, tmp
 
 def test_mount_survives_an_unimportable_fork_module(upstream_sync_env, monkeypatch, tmp_path, capsys):
     """The import itself failing must also fall through — the previous test only
-    covered a raising call, which is a different failure."""
+    covered a raising call, which is a different failure.
+
+    A `None` entry in sys.modules makes `from hermes_cli.fork_merge import ...`
+    raise ImportError, which is the closest reproduction of a deleted or corrupted
+    module file. Asserting only the fallback line would prove nothing: that line
+    printed even before the mount existed. The report line is the new contract.
+    """
     hermes_main = upstream_sync_env
     _set_counts(monkeypatch, hermes_main, origin_ahead=26, upstream_ahead=43)
-    monkeypatch.setitem(sys.modules, "hermes_cli.fork_merge", None)  # forces ImportError
+    monkeypatch.setitem(sys.modules, "hermes_cli.fork_merge", None)
 
     hermes_main._sync_with_upstream_if_needed(["git"], tmp_path)
-    assert "Skipping upstream sync to preserve your changes." in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "fork merge unavailable" in out, \
+        "an unimportable module must be reported once, not swallowed"
+    assert "Skipping upstream sync to preserve your changes." in out, \
+        "and upstream's behavior must still run"

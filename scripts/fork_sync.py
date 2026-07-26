@@ -935,12 +935,19 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
 
 
 def push_after_update(branch: str = "main") -> int:
-    """Push the fork once the running install has caught up to local HEAD.
+    """Publish the fork when the local tree is ahead of origin.
 
-    Split out from `sync()` on purpose: pushing during the sync makes
-    `rev-list HEAD..origin/<branch>` zero, which makes `hermes update` return
-    early and skip dependency install + the desktop rebuild. So the push has to
-    happen AFTER the update has applied, not before it is offered.
+    `sync()` pushes at the end of its own run, after the catch-up steps, so this
+    is not part of the normal path. It exists as a manual/idempotent repair entry
+    point (`fork_sync.py push`) for the case where a sync completed its merge and
+    verification but the push itself failed.
+
+    (Historical note, because the previous docstring stated the opposite as
+    current design: an abandoned revision deferred the push entirely so the app's
+    native popup would fire and the user's click would run the full
+    `hermes update` body. That never worked — on a fork, `hermes update` declines
+    to merge upstream at all, so the popup had nothing to offer. Fixed at the
+    source by the `fork-aware-update` patch; see fork/CUSTOMIZATIONS.md.)
 
     Safe to run any time — it only pushes when the local tree is clean and
     genuinely ahead of the fork.
