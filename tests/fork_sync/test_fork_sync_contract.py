@@ -229,6 +229,38 @@ def test_update_mechanism_is_never_ai_resolved(engine):
         assert required in protected, f"{required} must be hand-resolve only"
 
 
+# ── the resolver's context file must actually be found ───────────────────────
+def test_customizations_file_is_locatable():
+    """The resolver is sent CUSTOMIZATIONS.md as its only context about intent.
+
+    If the path is stale the sync does not fail — it resolves conflicts BLIND,
+    which is far worse than an error. This asserts the file exists where the
+    engine looks, so moving it can never silently strip that context.
+    """
+    candidates = [REPO_ROOT / "fork" / "CUSTOMIZATIONS.md",
+                  REPO_ROOT / "CUSTOMIZATIONS.md"]
+    found = [p for p in candidates if p.is_file()]
+    assert found, (
+        "CUSTOMIZATIONS.md not found at any path the engine checks: "
+        f"{[str(p) for p in candidates]}"
+    )
+    text = found[0].read_text(encoding="utf-8", errors="replace")
+    assert len(text) > 500, "the resolver context file looks truncated or empty"
+
+
+def test_changelog_entries_exist():
+    """Changelog lives as one file per change under fork/changelog/entries/."""
+    entries = REPO_ROOT / "fork" / "changelog" / "entries"
+    assert entries.is_dir(), f"missing changelog entries dir: {entries}"
+    files = sorted(entries.glob("*.md"))
+    assert files, "no changelog entries found"
+    index = (REPO_ROOT / "fork" / "changelog" / "README.md").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    missing = [f.name for f in files if f.name not in index]
+    assert not missing, f"entries missing from the changelog index: {missing}"
+
+
 # ── state must live in ONE place regardless of environment ───────────────────
 def test_state_dir_is_environment_independent(engine, monkeypatch):
     """State must not move when HERMES_HOME is set or unset.

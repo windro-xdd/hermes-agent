@@ -114,8 +114,8 @@ When a customization touches an area with known upstream churn, say so.
 
 ### R9 — Every change gets a CHANGELOG entry
 New feature, bug fix, or a modification to built-in Hermes behavior — it goes in
-`CHANGELOG-FORK.md`, in the same commit, using the format defined there. No entry,
-no merge. See that file for the required fields.
+`fork/changelog/entries/` as its own dated file, in the same commit, and indexed
+in `fork/changelog/README.md`. No entry, no merge. See that README for the format.
 
 ### R10 — Never `reset --hard` this fork
 It silently destroys fork commits. Not in scripts, not in the patched updater, not
@@ -172,20 +172,25 @@ this file useful to a resolver model and to future work — do not skip them.
 
 #### `customizations-registry` — fork rulebook, patch registry, changelog
 - **Status:** active
-- **Files:** `CUSTOMIZATIONS.md` + `CHANGELOG-FORK.md` (both new). No upstream file
-  touched.
+- **Files:** `fork/CUSTOMIZATIONS.md` + `fork/changelog/` (index + one file per
+  change). No upstream file touched.
 - **What:** documents the fork's rules and every customization.
 - **Why:** a diff does not record intent; without intent, a rebase conflict gets
   resolved by guesswork and a customization silently dies.
 - **Mount:** none — root-level new file, conflict-free by construction.
 - **Depends on:** nothing.
-- **If the seam moves:** if upstream ever adds its own `CUSTOMIZATIONS.md`, rename
-  ours to `FORK-CUSTOMIZATIONS.md` and update the path in `hermes-sync`.
+- **If the seam moves:** everything lives under `fork/`, a directory upstream does
+  not use, so a name collision is now very unlikely. `fork_sync.py` resolves the
+  file through a candidate list (current path, then the historical root path), and
+  a contract test asserts it is findable — a stale path would otherwise make the
+  resolver work *blind* rather than fail.
 - **Degrades to:** n/a — documentation.
-- **Next / related:** `CHANGELOG-FORK.md` (companion); read by
-  `updater-hermes-sync`.
-- **Deliberately not done:** not placed in `docs/` — upstream churns that
-  directory, and the resolver needs a predictable path.
+- **Next / related:** `fork/changelog/` (companion history); this file is read by
+  `fork-sync` and sent to the resolver as its only context about patch intent.
+- **Deliberately not done:** not placed in `docs/` — upstream owns and churns that
+  directory. `fork/` is a namespace upstream does not use, so fork docs cannot
+  collide with upstream's. Also not left as flat root files: a single shared
+  changelog collides on every concurrent edit and grows until unread.
 
 #### `fork-sync` — keep the fork current with upstream, losing nothing
 - **Status:** active

@@ -674,7 +674,15 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
     print(f"  {rec.upstream_commits} upstream commit(s); {rec.fork_patches} fork patch(es)")
 
     customizations = ""
-    cust = REPO_ROOT / "CUSTOMIZATIONS.md"
+    # Resolver context. Checked in order: the current location first, then the
+    # historical root path, so moving the file cannot silently strip the model's
+    # context (it would still "work" — just resolve conflicts blind).
+    cust = next(
+        (p for p in (REPO_ROOT / "fork" / "CUSTOMIZATIONS.md",
+                     REPO_ROOT / "CUSTOMIZATIONS.md")
+         if p.is_file()),
+        REPO_ROOT / "fork" / "CUSTOMIZATIONS.md",
+    )
     if cust.exists():
         customizations = cust.read_text(encoding="utf-8", errors="replace")
 
