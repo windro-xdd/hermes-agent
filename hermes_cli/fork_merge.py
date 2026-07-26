@@ -40,11 +40,22 @@ WHY THE MERGE MUST DO ITS OWN DEPS + REBUILD
     duplicated work — slow, not wrong.
 
 DEGRADATION (R6)
-    Every failure path returns False, which makes the caller fall through to
-    upstream's original behavior. A missing script, an unreadable module, a
-    broken git, an exception anywhere: the worst case is "the fork merge did not
-    run", never "hermes update crashed". Updating must never be breakable by
-    this file.
+    Nothing here may raise. An exception anywhere — a missing script, an
+    unreadable module, a broken git — is caught and the worst case is "the fork
+    merge did not run", never "hermes update crashed".
+
+    Note the return contract precisely, because it is not "False on any problem":
+
+      False  the merge did NOT run (switched off, engine unavailable, engine
+             declined, nothing to do). The caller must run its original code
+             path, including its own messages.
+      True   the situation was HANDLED, and that includes two failure outcomes.
+             `FAILED` (the engine ran, failed, and restored its rollback point)
+             and `CRASHED` (the engine raised; state unknown, nothing rolled
+             back) both return True, because the engine has already told the user
+             what happened. Printing upstream's "Skipping upstream sync to
+             preserve your changes" on top of a reported failure would be
+             actively misleading.
 
 OFF SWITCH
     `HERMES_FORK_MERGE=0` (also: false/no/off) disables it, and upstream's exact
@@ -213,10 +224,17 @@ def merge_upstream_into_fork(cwd: Path, branch: str = "main") -> bool:
     if outcome == MERGED:
         return True
     if outcome == FAILED:
-        # The engine restored its rollback point on this path, so this is a fact,
-        # not a hope.
-        print("  ℹ Your customizations are intact and the previous build is "
-              "still running.", flush=True)
+        # Every nonzero return from the engine calls its rollback() first, and
+        # rollback never uses `reset --hard`, so no fork COMMIT can be lost here.
+        # The working tree is a weaker guarantee: rollback checks none of its git
+        # return codes and handles its own partial failure by printing a warning
+        # about leftover modified files. So promise the part that is guaranteed
+        # and point at the engine's own warning for the part that is not.
+        print("  ℹ No fork commits were lost, and the previous build is still "
+              "running.", flush=True)
+        print("    If a rollback warning appeared above, the working tree may "
+              "still hold merged files — follow the recovery line it printed.",
+              flush=True)
         return True
     if outcome == CRASHED:
         print("  ⚠ The fork merge crashed. The repository state was NOT rolled "

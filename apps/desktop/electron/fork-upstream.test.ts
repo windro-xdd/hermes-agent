@@ -107,7 +107,10 @@ test('a garbled count cannot invent an update', async () => {
 test('the probe only runs when origin found nothing', () => {
   assert.equal(shouldProbeUpstream({ originBehind: 0 }), true)
   assert.equal(shouldProbeUpstream({ originBehind: 3 }), false)
-  assert.equal(shouldProbeUpstream({ originBehind: 0, supported: false }), false)
+  // Payload health is the wrapper's job, asserted in 'leaves an errored or
+  // unsupported payload alone' below — not this predicate's.
+  assert.equal(shouldProbeUpstream({ originBehind: '0' }), true)
+  assert.equal(shouldProbeUpstream({ originBehind: undefined }), true)
 })
 
 test('a missing git runner is handled, not thrown', async () => {
@@ -215,4 +218,49 @@ test('a probe failure returns the original payload untouched', async () => {
   const status = await withForkUpstreamStatus(Promise.resolve(originStatus()), git, { env: {} })
   assert.equal(status.behind, 0)
   assert.equal(status.forkUpstream, undefined)
+})
+
+test('a null or non-object payload passes straight through', async () => {
+  const git = forkGit()
+  assert.equal(await withForkUpstreamStatus(Promise.resolve(null), git, { env: {} }), null)
+  assert.equal(await withForkUpstreamStatus(Promise.resolve(undefined), git, { env: {} }), undefined)
+  assert.deepEqual(git.calls, [], 'nothing to decorate means nothing to probe')
+})
+
+// FAIL-BEFORE: the sha lookup's exit code was ignored, so a failing
+// `rev-parse upstream/main` yielded targetSha:'' while behind stayed 43. The
+// renderer refuses to raise the notification without a targetSha
+// (src/store/updates.ts), so the popup went silent while claiming 43 commits —
+// the precise failure this feature exists to remove.
+test('a failed sha lookup reports nothing rather than a count with no sha', async () => {
+  const git = gitStub([
+    ['remote get-url upstream', ok('https://example.com/x.git')],
+    ['rev-list', ok('43')],
+    ['rev-parse', fail('unknown revision')]
+  ])
+  assert.equal(await resolveForkUpstreamStatus({ git, branch: 'main' }), null)
+})
+
+test('an empty sha with a zero exit is also rejected', async () => {
+  const git = gitStub([
+    ['remote get-url upstream', ok('https://example.com/x.git')],
+    ['rev-list', ok('43')],
+    ['rev-parse', ok('   \n')]
+  ])
+  assert.equal(await resolveForkUpstreamStatus({ git, branch: 'main' }), null)
+})
+
+test('a good origin targetSha is never replaced by an empty one', async () => {
+  const git = gitStub([
+    ['remote get-url upstream', ok('https://example.com/x.git')],
+    ['rev-list', ok('43')],
+    ['rev-parse', fail('boom')]
+  ])
+  const status = await withForkUpstreamStatus(
+    Promise.resolve(originStatus({ targetSha: 'origin-sha' })),
+    git,
+    { env: {} }
+  )
+  assert.equal(status.targetSha, 'origin-sha')
+  assert.equal(status.behind, 0)
 })

@@ -260,8 +260,11 @@ to update at all.
    original lines stay in place as the fallback, not deleted and not re-indented.
    Where a single existing line genuinely must change (wrapping a call), that is
    allowed, but exactly one line and never a block. Measured against
-   `upstream/main`: `hermes_cli/main.py` +20/−0, `apps/desktop/electron/main.ts`
-   +9/−1 (the one removal is the wrapped call itself).
+   the **merge base** (`git diff $(git merge-base upstream/main HEAD)..HEAD
+   --numstat`, never a two-dot diff against `upstream/main` — that attributes
+   upstream's own newer commits to the fork and reported 111 files instead of 21):
+   `hermes_cli/main.py` +23/−0, `apps/desktop/electron/main.ts` +9/−1, where the
+   one removal is the wrapped call itself.
 2. **It degrades to exactly upstream behavior.** If the fork module is missing,
    switched off, throws, or declines, the original code path runs unchanged. A
    test asserts the fallback, not just the happy path. **Every mount honors the
@@ -465,7 +468,7 @@ this file useful to a resolver model and to future work — do not skip them.
     three-repo end-to-end merge.
   - **Upstream mounts (2 files):**
     `hermes_cli/main.py::_sync_with_upstream_if_needed` — one additive block
-    inside the `origin_ahead > 0` branch (+20/−0);
+    inside the `origin_ahead > 0` branch (+23/−0 against the merge base);
     `apps/desktop/electron/main.ts` — one import plus **one wrapped line** at the
     `ipcMain.handle('hermes:updates:check', ...)` handler (+9/−1). `checkUpdates()`
     itself is byte-identical to upstream: the decoration happens to its *result*,
@@ -515,8 +518,19 @@ this file useful to a resolver model and to future work — do not skip them.
 - **Degrades to:** exactly upstream behavior. Missing module, `HERMES_FORK_MERGE=0`,
   an exception, a dirty tree, or a path mismatch between the caller and the
   engine's own checkout all return "not handled", and upstream's original lines
-  run. Asserted by `test_mount_falls_back_to_upstream_message` and
-  `test_mount_survives_a_broken_fork_module`.
+  run. Asserted by `test_mount_falls_back_to_upstream_message`,
+  `test_mount_survives_a_broken_fork_module`, and
+  `test_mount_survives_an_unimportable_fork_module`.
+  **Two outcomes deliberately do NOT fall through:** a reported engine failure and
+  a crash both count as handled, because the engine has already told the user what
+  happened and adding "Skipping upstream sync to preserve your changes" on top
+  would be misleading. See the return contract in `hermes_cli/fork_merge.py`.
+- **Known limitation — the off switch and a running app:** `HERMES_FORK_MERGE` is
+  read from the environment. The Electron main process snapshots its environment at
+  launch, so exporting the variable in a shell disables the Python merge on the next
+  `hermes update` but leaves the *already running* app's probe active until it is
+  restarted. During that window the popup can still offer commits the merge will
+  decline. Restart the desktop app after flipping the switch.
 - **Next / related:** the nightly scheduled sync now overlaps this — if it keeps
   merging at 04:00, the popup rarely has anything to show. Deciding whether the
   nightly becomes check-and-notify (so the user drives updates from the button) is
