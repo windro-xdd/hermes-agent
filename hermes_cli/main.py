@@ -8017,6 +8017,26 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     # If origin/main has commits not on upstream, don't trample
     if origin_ahead > 0:
+        # FORK PATCH `fork-aware-update` — mount point only, logic lives in
+        # hermes_cli/fork_merge.py. Upstream stops here to avoid trampling a
+        # fork's own commits. On this fork those commits ARE the product, and
+        # stopping means `hermes update` can never bring upstream in: this
+        # branch is reached exactly when origin has nothing new, which is the
+        # normal state of a fork that pushes its own merges. So merge
+        # upstream/main in instead (AI-resolving conflicts, verifying, then
+        # installing deps / rebuilding the desktop if the merge touched them).
+        # Returns False when that machinery is absent, switched off, or
+        # declines — in which case upstream's original message below runs
+        # unchanged. Keep those lines intact; they are the fallback, not dead
+        # code.
+        if upstream_ahead > 0:
+            try:
+                from hermes_cli.fork_merge import merge_upstream_into_fork
+
+                if merge_upstream_into_fork(cwd, "main"):
+                    return
+            except Exception:
+                pass
         print()
         print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
         print("  Skipping upstream sync to preserve your changes.")
