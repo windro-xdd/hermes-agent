@@ -650,20 +650,61 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
         return finish("ok", f"dry run: {rec.upstream_commits} commit(s) merged and verified, "
                             f"not pushed (rollback: {rec.rollback_tag})", 0)
 
-    # Push so the fork commit exists somewhere other than this disk, and so the
-    # desktop app's update check sees the new commits on origin. No --force: a
-    # merge never rewrites history, so a plain push always succeeds.
-    print("→ pushing fork")
-    pushed = git("push", "origin", branch)
-    rec.pushed = pushed.returncode == 0
-    if not rec.pushed:
-        return finish("ok",
-                      f"merged and verified, but push failed: "
-                      f"{(pushed.stderr or pushed.stdout).strip().splitlines()[-1:] or ['unknown']}", 0)
-
+    # DO NOT PUSH HERE. This is deliberate and load-bearing — an earlier version
+    # pushed at this point and it broke the update flow.
+    #
+    # `hermes update` computes `rev-list HEAD..origin/<branch> --count` and, when
+    # that is 0, RETURNS EARLY (main.py:11406 -> 11513) printing "Already up to
+    # date!". Pushing here makes origin == local, so the count is 0 and the update
+    # exits before the steps that follow the git pull:
+    #   * "Updating Python dependencies..." (main.py:11648)
+    #   * the desktop rebuild (electron/main.ts:3165)
+    # Result: merged source code running against stale deps and a stale app
+    # bundle, while the UI cheerfully reports everything is current. The native
+    # popup also never fires, because it reads the same count.
+    #
+    # Leaving origin BEHIND is what keeps the stock update flow intact: the popup
+    # fires, the user clicks Update, and `hermes update` runs its FULL body —
+    # pull (a clean fast-forward, since we merged rather than rebased), syntax
+    # validation, dependency install, and rebuild.
+    #
+    # The fork is pushed separately, after the app has caught up: see
+    # `push_after_update()` below, which the post-update path calls.
+    behind_origin = git.out("rev-list", "--count", f"origin/{branch}..HEAD")
     return finish("ok",
-                  f"synced {rec.upstream_commits} upstream commit(s); "
-                  f"{rec.fork_patches} customization(s) intact; pushed", 0)
+                  f"merged {rec.upstream_commits} upstream commit(s); "
+                  f"{rec.fork_patches} customization(s) intact; "
+                  f"{behind_origin} commit(s) staged locally — "
+                  "Hermes will offer the update, and the fork is pushed after it applies", 0)
+
+
+def push_after_update(branch: str = "main") -> int:
+    """Push the fork once the running install has caught up to local HEAD.
+
+    Split out from `sync()` on purpose: pushing during the sync makes
+    `rev-list HEAD..origin/<branch>` zero, which makes `hermes update` return
+    early and skip dependency install + the desktop rebuild. So the push has to
+    happen AFTER the update has applied, not before it is offered.
+
+    Safe to run any time — it only pushes when the local tree is clean and
+    genuinely ahead of the fork.
+    """
+    git = Git(REPO_ROOT)
+    if [l for l in git.out("status", "--porcelain").splitlines()
+            if l and not l.startswith("??")]:
+        print("⚠ uncommitted changes; not pushing")
+        return 0
+    ahead = git.out("rev-list", "--count", f"origin/{branch}..HEAD")
+    if ahead in ("", "0"):
+        print("✓ fork already up to date")
+        return 0
+    pushed = git("push", "origin", branch)
+    if pushed.returncode != 0:
+        tail = (pushed.stderr or pushed.stdout).strip().splitlines()[-1:] or ["unknown"]
+        print(f"⚠ push failed: {tail[0]}")
+        return 1
+    print(f"✓ pushed {ahead} commit(s) to the fork")
+    return 0
 
 
 def status(branch: str = "main") -> int:
@@ -696,7 +737,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         prog="fork_sync",
         description="Keep this fork current with upstream without losing customizations.",
     )
-    ap.add_argument("command", nargs="?", default="sync", choices=["sync", "status"])
+    ap.add_argument("command", nargs="?", default="sync",
+                    choices=["sync", "status", "push"])
     ap.add_argument("--branch", default="main")
     ap.add_argument("--dry-run", action="store_true", help="merge and verify, but do not push")
     ap.add_argument("--no-ai", action="store_true", help="defer on conflict instead of calling the resolver")
@@ -705,6 +747,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "status":
         return status(args.branch)
+    if args.command == "push":
+        return push_after_update(args.branch)
     return sync(args.branch, dry_run=args.dry_run, no_ai=args.no_ai,
                 quick_verify=args.quick_verify)
 
