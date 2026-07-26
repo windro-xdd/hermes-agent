@@ -848,28 +848,27 @@ def sync(branch: str = "main", *, dry_run: bool = False, no_ai: bool = False,
         return finish("ok", f"dry run: {rec.upstream_commits} commit(s) merged and verified, "
                             f"not pushed (rollback: {rec.rollback_tag})", 0)
 
-    # DO NOT PUSH HERE. This is deliberate and load-bearing — an earlier version
-    # pushed at this point and it broke the update flow.
+    # THE CATCH-UP STEPS RUN HERE, BEFORE THE PUSH. Both halves of that are
+    # load-bearing, and an earlier revision got each of them wrong in turn.
     #
-    # `hermes update` computes `rev-list HEAD..origin/<branch> --count` and, when
-    # that is 0, RETURNS EARLY (main.py:11406 -> 11513) printing "Already up to
-    # date!". Pushing here makes origin == local, so the count is 0 and the update
-    # exits before the steps that follow the git pull:
-    #   * "Updating Python dependencies..." (main.py:11648)
-    #   * the desktop rebuild (electron/main.ts:3165)
-    # Result: merged source code running against stale deps and a stale app
-    # bundle, while the UI cheerfully reports everything is current. The native
-    # popup also never fires, because it reads the same count.
+    # Why here: this checkout IS the running install, so the post-pull work
+    # `hermes update` would normally do — dependency install, desktop rebuild —
+    # has to happen as part of the merge. Nobody else will do it.
     #
-    # Leaving origin BEHIND is what keeps the stock update flow intact: the popup
-    # fires, the user clicks Update, and `hermes update` runs its FULL body —
-    # pull (a clean fast-forward, since we merged rather than rebased), syntax
-    # validation, dependency install, and rebuild.
+    # Why before the push: `hermes update` computes
+    # `rev-list HEAD..origin/<branch> --count` and returns early when it is 0.
+    # Pushing first makes origin == local, driving that count to 0 and skipping
+    # exactly these steps — merged source running against a stale venv and a
+    # stale app bundle while the UI reports everything is current.
     #
-    # The fork is pushed separately, after the app has caught up: see
-    # `push_after_update()` below, which the post-update path calls.
-    # The merge lands in the RUNNING install (this checkout IS the app), so the
-    # post-pull steps `hermes update` would normally perform must happen here.
+    # (A previous version of this comment claimed the push must be deferred
+    # entirely so the native popup would fire and the user's click would run the
+    # full `hermes update` body. That was abandoned: on a fork, `hermes update`
+    # declines to merge upstream at all, so the popup had nothing to offer. The
+    # `fork-aware-update` patch fixes that at the source — see the registry entry
+    # in fork/CUSTOMIZATIONS.md. `push_after_update()` remains as a separate,
+    # idempotent entry point for pushing when the tree is genuinely ahead.)
+    #
     # Only run what the diff actually requires — a rebuild costs minutes.
     followups: list[str] = []
     # `changed` is the merged diff computed above (pre_sha..HEAD). An earlier

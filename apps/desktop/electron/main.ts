@@ -81,8 +81,8 @@ import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
-// FORK PATCH `fork-aware-update` — see ./fork-upstream and checkUpdates().
-import { resolveForkUpstreamStatus, shouldProbeUpstream } from './fork-upstream'
+// FORK PATCH `fork-aware-update` — mounted at the 'hermes:updates:check' handler.
+import { withForkUpstreamStatus } from './fork-upstream'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { scanGitRepos } from './git-repo-scan'
@@ -2440,29 +2440,14 @@ async function checkUpdates() {
 
   const commits = behind > 0 ? await readCommitLog(updateRoot, branch) : []
 
-  // FORK PATCH `fork-aware-update` — mount only; logic lives in ./fork-upstream.
-  // `behind` above measures HEAD..origin/<branch>, i.e. distance from the remote
-  // this checkout PUSHES to. A fork that merges upstream itself and then pushes
-  // is always level with origin, so that number is permanently 0 and the update
-  // popup can never fire. When origin has nothing to report, ask the `upstream`
-  // remote instead. Returns null on a non-fork install, offline, or anything
-  // unexpected, in which case the origin answer below is used untouched.
-  const forkUpstream = shouldProbeUpstream({ originBehind: behind })
-    ? await resolveForkUpstreamStatus({
-        git: args => runGit(args, { cwd: updateRoot }),
-        branch
-      })
-    : null
-
   return {
     supported: true,
     branch,
     currentBranch,
-    behind: forkUpstream ? forkUpstream.behind : behind,
+    behind,
     currentSha,
-    targetSha: forkUpstream ? forkUpstream.targetSha : targetSha,
+    targetSha,
     commits,
-    forkUpstream: forkUpstream ? forkUpstream.ref : null,
     dirty: dirtyStr.length > 0,
     hermesRoot: updateRoot,
     fetchedAt: Date.now()
@@ -10537,7 +10522,13 @@ ipcMain.handle('hermes:terminal:cwd', async (_event, id) => {
 ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession(String(id || '')))
 
 ipcMain.handle('hermes:updates:check', async () =>
-  checkUpdates().catch(error => ({
+  // FORK PATCH `fork-aware-update`: checkUpdates() measures HEAD..origin/<branch>,
+  // the distance from the remote this fork PUSHES to — permanently 0 once the sync
+  // has pushed, so the popup could never fire. withForkUpstreamStatus decorates
+  // that payload with the `upstream` remote's count when origin found nothing.
+  // Returns the payload untouched on a non-fork install, when HERMES_FORK_MERGE is
+  // off, or on any failure. checkUpdates() itself is unmodified.
+  withForkUpstreamStatus(checkUpdates(), args => runGit(args, { cwd: resolveUpdateRoot() })).catch(error => ({
     supported: true,
     branch: readDesktopUpdateConfig().branch,
     error: 'check-failed',
