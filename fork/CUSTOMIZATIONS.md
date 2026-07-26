@@ -112,32 +112,135 @@ rejected alternative is worth writing down — without it, someone re-litigates 
 same decision in six months, or "fixes" something that was a conscious tradeoff.
 When a customization touches an area with known upstream churn, say so.
 
-### R9 — Every change gets a CHANGELOG entry
-New feature, bug fix, or a modification to built-in Hermes behavior — it goes in
-`fork/changelog/entries/` as its own dated file, in the same commit, and indexed
-in `fork/changelog/README.md`. No entry, no merge. See that README for the format.
+### R9 — Every change gets a changelog entry, in the same commit
+**Where:** `fork/changelog/entries/YYYY-MM-DD-NN-short-slug.md` — **one file per
+change**, never appended to a shared file. Add a row to the index table in
+`fork/changelog/README.md` in the same commit. A flat shared log collides on every
+concurrent edit and grows until nobody reads it; separate files cannot conflict
+with each other.
 
-### R10 — Never `reset --hard` this fork
+**When:** anything that changes behavior or the shape of the fork —
+
+| Type | For |
+|---|---|
+| `Added` | a new feature or capability |
+| `Fixed` | a bug fix, ours or on top of upstream's |
+| `Customized` | a modification to built-in Hermes behavior (the common case) |
+| `Changed` | a rework of an existing fork patch |
+| `Retired` | a patch removed, usually because upstream absorbed it |
+| `Infrastructure` | repo/tooling/topology changes affecting how updates work |
+| `Upstream sync` | a sync that needed conflict resolution, and what the AI resolved |
+
+Not logged: comment typos, formatting, anything with no behavioral or structural
+effect. A clean sync with no conflict needs no entry.
+
+**Required fields** — all of them, every entry:
+
+```markdown
+# <Type>: <one-line summary>
+
+**Date:** YYYY-MM-DD
+**Type:** <one of the table above>
+
+- **Patch id:** matches the registry below (`—` if not a registered patch)
+- **Why:** the problem or request that caused this — not a restatement of the what
+- **Changed:** files, and what each one does now
+- **Impact:** what a user notices (`none (internal)` is valid)
+- **Risk / watch for:** how this could break later, and the symptom it would show
+- **Verified:** the actual command run and its real output
+- **Follow-ups:** known gaps, deferred work, related changes expected next
+```
+
+**Rules for entries:**
+- **Same commit as the code.** An entry written later is written from memory, and
+  memory is where the "why" is lost.
+- **Append-only.** Correct a past entry by adding a new one that supersedes it;
+  never edit history. A changelog you rewrite is a changelog nobody can trust.
+- **"Why" must stand alone.** Assume the reader has no memory of the conversation
+  that produced the change — in six months, nobody will.
+- **"Verified" means it was actually run.** Paste the real result. An unverified
+  entry is worse than none: it manufactures false confidence.
+- **"Risk / watch for" is the forward-looking field (R8).** Name the upstream seam,
+  assumption, or platform quirk this depends on. It is what turns a future failure
+  into a five-minute diagnosis.
+
+**No entry, no merge.** Enforced by review, plus
+`tests/fork_sync/test_fork_sync_contract.py::test_changelog_entries_exist`, which
+fails if an entry file is not linked from the index.
+
+### R10 — Every change goes through a branch, never straight to `main`
+No commit lands directly on `main`. One branch per change, merged back only when
+it is complete and verified.
+
+**Branch naming** — type, then a short slug:
+
+| Prefix | For |
+|---|---|
+| `fix/` | a bug fix |
+| `feat/` | a new capability |
+| `custom/` | a modification to built-in Hermes behavior |
+| `docs/` | documentation only |
+| `chore/` | tooling, deps, repo mechanics |
+
+e.g. `fix/rebuild-path`, `custom/model-prompts-in-settings`.
+
+**The workflow:**
+
+```bash
+git switch -c fix/<slug> main       # branch from a clean, current main
+# ... make the change, plus its registry entry (R3) and changelog entry (R9)
+git switch main
+git merge --no-ff fix/<slug>        # --no-ff keeps the branch visible in history
+git branch -d fix/<slug>            # delete once merged
+```
+
+`--no-ff` is deliberate: a fast-forward merge erases the fact that the work was a
+unit, which defeats the point of branching. The merge commit is the record of what
+shipped together.
+
+**Before merging back**, all of these must hold:
+- the change is complete — no "will finish on main"
+- `python -m pytest tests/fork_sync/ -q` passes (and any other relevant suite)
+- registry entry updated (R3) and changelog entry written (R9), in the branch
+- `main` has not moved underneath you; if it has, merge `main` into the branch
+  first and re-verify
+
+**Never** force-push a branch that has been merged, and never rebase `main`
+itself — see R11 and the merge-not-rebase reasoning under `fork-sync`.
+
+**One interaction to know about (R10 ↔ `fork-sync`):** the automatic sync merges
+`upstream/main` into `main` and requires a clean tree with no tracked
+modifications. An in-progress feature branch is fine — the sync only touches
+`main` — but **uncommitted work on any branch defers the sync** with
+"N uncommitted change(s) in the repo". So commit or stash before leaving work
+overnight, or the 04:00 sync silently skips. It reports this and retries the next
+day; nothing is lost, but updates stall until the tree is clean.
+
+**Exception, narrow:** a single-commit hotfix to an actively broken install may go
+straight to `main`, and only when a branch would prolong the outage. It still needs
+its registry and changelog entries in the same commit.
+
+### R11 — Never `reset --hard` this fork
 It silently destroys fork commits. Not in scripts, not in the patched updater, not
 manually. Recovery point before any risky git operation is a **tag**, and the
 recovery move is `git rebase --abort` or checking out the tag — never a hard reset.
 
-### R11 — No AI-resolved conflict is trusted until it builds
+### R12 — No AI-resolved conflict is trusted until it builds
 A conflict resolved by the model is a *proposal*. It is accepted only after the
 desktop build and typecheck pass. Failure, or the model reporting low confidence,
 means abort, roll back, and notify. A failed update **defers**; it never ships a
 broken tree.
 
-### R12 — Secrets stay out of the repo
+### R13 — Secrets stay out of the repo
 API keys, tokens, and personal paths live in user data or the environment. This
 fork is on GitHub.
 
-### R13 — `git rerere` stays enabled
+### R14 — `git rerere` stays enabled
 `rerere.enabled` and `rerere.autoupdate` are on. Git remembers how a conflict was
 resolved and replays it automatically next time, so a recurring conflict costs one
 model call ever, not one per update.
 
-### R14 — The updater patch is the fragile one
+### R15 — The updater patch is the fragile one
 The patch that redirects the native Update button into `hermes-sync` modifies the
 very code that performs updates. If it ever conflicts, **a human resolves that one
 by hand** — the model must not auto-resolve a conflict in the update path, because

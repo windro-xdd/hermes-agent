@@ -26,6 +26,7 @@ Newest first.
 
 | Date | Type | Change |
 |---|---|---|
+| 2026-07-26 | Infrastructure | [Require a branch workflow, and make the changelog rule self-contained](entries/2026-07-26-06-require-branch-workflow-and-complete-the-changelog-rule.md) |
 | 2026-07-26 | Infrastructure | [Move fork docs into a `fork/` namespace, one file per change](entries/2026-07-26-05-move-fork-docs-into-a-fork-namespace.md) |
 | 2026-07-26 | Fixed | [Six defects in the sync engine, all found by running it](entries/2026-07-26-04-six-defects-in-the-sync-engine-all-found-by-running-it.md) |
 | 2026-07-26 | Added | [Automatic upstream sync with AI conflict resolution](entries/2026-07-26-03-automatic-upstream-sync-with-ai-conflict-resolution.md) |
