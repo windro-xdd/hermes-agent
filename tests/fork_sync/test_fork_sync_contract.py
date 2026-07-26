@@ -227,5 +227,9 @@ def test_missing_test_harness_is_not_reported_as_failure(engine, monkeypatch):
 
     monkeypatch.setattr(engine.subprocess, "run", fake_run)
     ok, notes = engine.verify(["agent/example.py"])
+    # Assert the CONTRACT (verification still passes, and the note says the suite
+    # was skipped) rather than an exact sentence — pinning the wording made this
+    # test fail on a message reword that changed no behavior.
     assert ok, f"a missing harness must not fail verification (notes: {notes})"
-    assert "pytest not installed" in notes
+    assert "skipped" in notes.lower(), \
+        f"the note must state the suite was skipped, got: {notes!r}"

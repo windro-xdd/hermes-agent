@@ -356,22 +356,63 @@ def verify(changed: Iterable[str], *, quick: bool = False) -> tuple[bool, str]:
         return True, "; ".join(notes) or "parse-only (quick mode)"
 
     if py:
-        # The suite needs pytest in the repo venv. On this install it is absent,
-        # and "the harness cannot run" is NOT the same failure as "the tests
-        # failed" — conflating them would fail every single sync and train the
-        # user to ignore the alert. Probe first, and degrade to the import check
-        # (which does exercise the changed modules) while saying so plainly.
-        have_pytest = subprocess.run(
-            [sys.executable, "-c", "import pytest"],
-            capture_output=True, text=True,
-        ).returncode == 0
+        # The suite needs a venv that scripts/run_tests.sh can actually SELECT.
+        # "The harness cannot run" is NOT the same failure as "the tests failed":
+        # conflating them fails every sync and trains the user to ignore the
+        # alert. So probe what run_tests.sh itself probes, not just whether
+        # pytest imports here.
+        #
+        # run_tests.sh (lines ~53-56) looks for `<venv>/bin/activate` and runs
+        # `<venv>/bin/python -c 'import pytest'` — a POSIX layout. On Windows a
+        # venv has Scripts/, not bin/, so the probe NEVER matches and the script
+        # exits with "no virtualenv with pytest found" even when pytest is
+        # installed. Checking `import pytest` in our own interpreter was the
+        # wrong test: it passed while the harness still could not start.
+        runner_can_start = any(
+            (REPO_ROOT / v / "bin" / "activate").is_file()
+            and subprocess.run(
+                [str(REPO_ROOT / v / "bin" / "python"), "-c", "import pytest"],
+                capture_output=True,
+            ).returncode == 0
+            for v in (".venv", "venv")
+        )
 
-        if not have_pytest:
-            failed_imports = _import_check(py)
-            if failed_imports:
-                return False, "changed module failed to import: " + "; ".join(failed_imports)
-            notes.append(f"imported {len(py)} changed module(s) "
-                         "(pytest not installed in the venv, so the suite was skipped)")
+        if not runner_can_start:
+            # run_tests.sh can't start here, but pytest itself may still work.
+            # Prefer the REAL suite over an import check whenever possible —
+            # skipping straight to imports threw away a genuine gate.
+            have_pytest = subprocess.run(
+                [sys.executable, "-c", "import pytest"], capture_output=True
+            ).returncode == 0
+
+            if have_pytest:
+                # Scope to tests that plausibly cover the changed modules, plus
+                # this project's own contracts. A full 2,300-file run per sync is
+                # not viable on a laptop.
+                targets = ["tests/fork_sync"]
+                for rel in py:
+                    guess = Path("tests") / Path(rel).with_suffix("")
+                    cand = REPO_ROOT / guess.parent / f"test_{guess.name}.py"
+                    if cand.is_file():
+                        targets.append(cand.relative_to(REPO_ROOT).as_posix())
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pytest", *dict.fromkeys(targets),
+                     "-q", "--no-header", "-p", "no:cacheprovider"],
+                    cwd=str(REPO_ROOT), capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=1800,
+                )
+                if proc.returncode != 0:
+                    tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-20:])
+                    return False, f"targeted tests failed:\n{tail}"
+                notes.append(f"pytest passed on {len(targets)} target(s) "
+                             "(run_tests.sh unusable on this platform: it probes "
+                             "bin/activate, Windows venvs use Scripts/)")
+            else:
+                failed_imports = _import_check(py)
+                if failed_imports:
+                    return False, "changed module failed to import: " + "; ".join(failed_imports)
+                notes.append(f"imported {len(py)} changed module(s) "
+                             "(no pytest available, so the suite was skipped)")
         else:
             proc = subprocess.run(
                 ["bash", "-lc", "cd '%s' && ./scripts/run_tests.sh" % REPO_ROOT.as_posix()],
